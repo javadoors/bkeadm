@@ -1,0 +1,95 @@
+# syntax=docker/dockerfile:latest
+
+#######################################################################
+# Copyright (c) 2025 Huawei Technologies Co., Ltd.
+# installer is licensed under Mulan PSL v2.
+# You can use this software according to the terms and conditions of the Mulan PSL v2.
+# You may obtain n copy of Mulan PSL v2 at:
+#          http://license.coscl.org.cn/MulanPSL2
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+# EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+# MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+# See the Mulan PSL v2 for more details.
+#######################################################################
+
+# 使用一个轻量级的基础镜像
+FROM alpine:3.18 AS builder
+
+# 设置工作目录
+WORKDIR /build
+
+RUN mkdir -p tmp
+RUN apk add curl tar gzip && \
+    # 下载第一个 tar.gz 文件
+    curl -L -o rpm.tar.gz https://openfuyao.obs.cn-north-4.myhuaweicloud.com/rpm/releases/download/v0.0.1/rpm.tar.gz && \
+    # 解压到指定目录，忽略所有权问题
+    tar -xzf rpm.tar.gz -C tmp --no-same-owner && \
+    # 删除原始压缩包以节省空间
+    rm rpm.tar.gz
+
+# 下载其他文件
+RUN curl -L -o kubectl-v1.34.3-of.1-arm64 https://openfuyao.obs.cn-north-4.myhuaweicloud.com/kubernetes/kubernetes/releases/download/1.34.3-of.1/bin/linux/arm64/kubectl && \
+    curl -L -o kubectl-v1.34.3-of.1-amd64 https://openfuyao.obs.cn-north-4.myhuaweicloud.com/kubernetes/kubernetes/releases/download/1.34.3-of.1/bin/linux/amd64/kubectl && \
+    curl -L -o kubelet-v1.34.3-of.1-arm64 https://openfuyao.obs.cn-north-4.myhuaweicloud.com/kubernetes/kubernetes/releases/download/1.34.3-of.1/bin/linux/arm64/kubelet && \
+    curl -L -o kubelet-v1.34.3-of.1-amd64 https://openfuyao.obs.cn-north-4.myhuaweicloud.com/kubernetes/kubernetes/releases/download/1.34.3-of.1/bin/linux/amd64/kubelet && \
+    curl -L -o containerd-v2.1.1-linux-amd64.tar.gz https://openfuyao.obs.cn-north-4.myhuaweicloud.com/containerd/containerd/releases/download/v2.1.1-origin/containerd-v2.1.1-linux-amd64.tar.gz && \
+    curl -L -o containerd-v2.1.1-linux-arm64.tar.gz https://openfuyao.obs.cn-north-4.myhuaweicloud.com/containerd/containerd/releases/download/v2.1.1-origin/containerd-v2.1.1-linux-arm64.tar.gz && \
+    curl -L -o cni-plugins-linux-amd64-v1.4.1.tgz https://openfuyao.obs.cn-north-4.myhuaweicloud.com/containernetworking/plugins/releases/download/v1.4.1/cni-plugins-linux-amd64-v1.4.1.tgz && \
+    curl -L -o cni-plugins-linux-arm64-v1.4.1.tgz https://openfuyao.obs.cn-north-4.myhuaweicloud.com/containernetworking/plugins/releases/download/v1.4.1/cni-plugins-linux-arm64-v1.4.1.tgz && \
+    curl -L -o helm-v3.14.2-linux-amd64.tar.gz https://openfuyao.obs.cn-north-4.myhuaweicloud.com/helm/releases/download/v3.14.2/helm-v3.14.2-linux-amd64.tar.gz && \
+    curl -L -o helm-v3.14.2-linux-arm64.tar.gz https://openfuyao.obs.cn-north-4.myhuaweicloud.com/helm/releases/download/v3.14.2/helm-v3.14.2-linux-arm64.tar.gz && \
+    curl -L -o yq_linux_arm64 https://openfuyao.obs.cn-north-4.myhuaweicloud.com/mikefarah/yq/releases/download/v4.43.1/yq_linux_arm64 && \
+    curl -L -o yq_linux_amd64 https://openfuyao.obs.cn-north-4.myhuaweicloud.com/mikefarah/yq/releases/download/v4.43.1/yq_linux_amd64 && \
+    curl -L -o jq-linux-arm64 https://openfuyao.obs.cn-north-4.myhuaweicloud.com/jqlang/jq/releases/download/v1.7.1/jq-linux-arm64 && \
+    curl -L -o jq-linux-amd64 https://openfuyao.obs.cn-north-4.myhuaweicloud.com/jqlang/jq/releases/download/v1.7.1/jq-linux-amd64 && \
+    curl -L -o cfssl-certinfo_1.6.4_linux_arm64 https://openfuyao.obs.cn-north-4.myhuaweicloud.com/cloudflare/cfssl/releases/download/v1.6.4/cfssl-certinfo_1.6.4_linux_arm64 && \
+    curl -L -o cfssl-certinfo_1.6.4_linux_amd64 https://openfuyao.obs.cn-north-4.myhuaweicloud.com/cloudflare/cfssl/releases/download/v1.6.4/cfssl-certinfo_1.6.4_linux_amd64 && \
+    curl -L -o cfssl_1.6.4_linux_arm64 https://openfuyao.obs.cn-north-4.myhuaweicloud.com/cloudflare/cfssl/releases/download/v1.6.4/cfssl_1.6.4_linux_arm64 && \
+    curl -L -o cfssl_1.6.4_linux_amd64 https://openfuyao.obs.cn-north-4.myhuaweicloud.com/cloudflare/cfssl/releases/download/v1.6.4/cfssl_1.6.4_linux_amd64 && \
+    curl -L -o cfssljson_1.6.4_linux_arm64 https://openfuyao.obs.cn-north-4.myhuaweicloud.com/cloudflare/cfssl/releases/download/v1.6.4/cfssljson_1.6.4_linux_arm64 && \
+    curl -L -o cfssljson_1.6.4_linux_amd64 https://openfuyao.obs.cn-north-4.myhuaweicloud.com/cloudflare/cfssl/releases/download/v1.6.4/cfssljson_1.6.4_linux_amd64 && \
+    curl -L -o runc-arm64 https://openfuyao.obs.cn-north-4.myhuaweicloud.com/opencontainers/runc/releases/download/v1.1.12/runc-arm64 && \
+    curl -L -o runc-amd64 https://openfuyao.obs.cn-north-4.myhuaweicloud.com/opencontainers/runc/releases/download/v1.1.12/runc-amd64 && \
+    curl -L -o etcdctl-v3.5.6-linux-amd64 https://openfuyao.obs.cn-north-4.myhuaweicloud.com/etcd-io/etcd/releases/download/v3.5.6/etcdctl-v3.5.6-linux-amd64 && \
+    curl -L -o etcdctl-v3.5.6-linux-arm64 https://openfuyao.obs.cn-north-4.myhuaweicloud.com/etcd-io/etcd/releases/download/v3.5.6/etcdctl-v3.5.6-linux-arm64 && \
+    curl -L -o charts.tar.gz https://openfuyao.obs.cn-north-4.myhuaweicloud.com/charts/releases/download/latest/charts.tar.gz && \
+    curl -L -o nfsshare.tar.gz https://openfuyao.obs.cn-north-4.myhuaweicloud.com/nfs/nfsshare.tar.gz
+
+# 创建新的目录结构并组合文件
+RUN mkdir -p source/files && \
+    mv tmp/* source/ && \
+    mv kubectl-v1.34.3-of.1-arm64 source/files && \
+    mv kubectl-v1.34.3-of.1-amd64 source/files && \
+    mv kubelet-v1.34.3-of.1-arm64 source/files && \
+    mv kubelet-v1.34.3-of.1-amd64 source/files && \
+    mv containerd-v2.1.1-linux-amd64.tar.gz source/files && \
+    mv containerd-v2.1.1-linux-arm64.tar.gz source/files && \
+    mv cni-plugins-linux-amd64-v1.4.1.tgz source/files && \
+    mv cni-plugins-linux-arm64-v1.4.1.tgz source/files && \
+    mv helm-v3.14.2-linux-amd64.tar.gz source/files && \
+    mv helm-v3.14.2-linux-arm64.tar.gz source/files && \
+    mv yq_linux_arm64 source/files && \
+    mv yq_linux_amd64 source/files && \
+    mv jq-linux-arm64 source/files && \
+    mv jq-linux-amd64 source/files && \
+    mv cfssl-certinfo_1.6.4_linux_arm64 source/files && \
+    mv cfssl-certinfo_1.6.4_linux_amd64 source/files && \
+    mv cfssl_1.6.4_linux_arm64 source/files && \
+    mv cfssl_1.6.4_linux_amd64 source/files && \
+    mv cfssljson_1.6.4_linux_arm64 source/files && \
+    mv cfssljson_1.6.4_linux_amd64 source/files && \
+    mv runc-arm64 source/files && \
+    mv runc-amd64 source/files && \
+    mv etcdctl-v3.5.6-linux-amd64 source/files && \
+    mv etcdctl-v3.5.6-linux-arm64 source/files && \
+    mv charts.tar.gz source/files && \
+    mv nfsshare.tar.gz source/files
+
+# 创建新的 tar.gz 包
+RUN tar -czf source.tar.gz -C source .
+
+# 第二阶段：创建最终镜像
+FROM scratch
+
+# 从构建阶段复制最终的 tar.gz 文件
+COPY --from=builder /build/source.tar.gz /bkesource/source.tar.gz
