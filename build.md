@@ -1,4 +1,141 @@
 
+## ONBUILD 镜像
+在 Dockerfile 里提到的 **ONBUILD 镜像**，其实是一种特殊的镜像构建机制。它允许你在镜像里预定义一些 **“触发指令”**，这些指令不会在当前镜像构建时执行，而是在 **该镜像被用作基础镜像时**才会自动执行。
+### 🛠️ ONBUILD 的作用
+- **延迟执行**：ONBUILD 指令在当前镜像构建时不会运行，而是在后续 `FROM` 这个镜像的 Dockerfile 中触发。  
+- **常见用途**：  
+  - 基础镜像里预设 `ONBUILD COPY . /src` 和 `ONBUILD RUN go build`，这样任何基于它的应用镜像都会自动复制源码并编译。  
+  - 适合做“模板镜像”，比如 Go、Node.js、Python 的构建基础镜像。
+### ✅ 示例：Go ONBUILD 镜像
+```dockerfile
+# 基础构建镜像
+FROM golang:1.24 AS base
+
+# 定义 ONBUILD 指令
+ONBUILD WORKDIR /app
+ONBUILD COPY . .
+ONBUILD RUN go build -o /go/bin/app -ldflags "$GOLDFLAGS" .
+```
+
+这样，当你写一个新的 Dockerfile：
+```dockerfile
+FROM base AS build
+```
+就会自动执行：
+- 进入 `/app`
+- 复制当前目录源码
+- 执行 `go build`
+### 🎯 总结
+- **ONBUILD 镜像**就是在镜像里预定义构建步骤，只有在被继承时才触发。  
+- 适合做通用的“构建模板”，比如自动编译 Go 应用。  
+- 在你之前的 Dockerfile 里没有 `RUN go build`，如果你想让它自动编译，可以在 Builder 镜像里加上 `ONBUILD RUN go build`。  
+
+# 镜像构建
+## ONBUILD 机制解析
+### 关键点
+bkeadm 的 Dockerfile 使用了：
+```dockerfile
+ARG BUILDER_IMAGE=cr.openfuyao.cn/openfuyao/builder/$BUILDER:$BUILDER_VERSION
+FROM $BUILDER_IMAGE AS build
+```
+这个 `builder/golang:1.24.5` 镜像是一个 **ONBUILD 镜像**，它在镜像定义中包含了延迟执行的指令。
+### ONBUILD 镜像的工作原理
+`golang:onbuild` 或类似的 builder 镜像内部定义了：
+```dockerfile
+# builder 镜像内部的 Dockerfile
+FROM golang:1.24.5
+
+# 这些 ONBUILD 指令在子镜像构建时才会执行
+ONBUILD COPY . /go/src/app
+ONBUILD WORKDIR /go/src/app
+ONBUILD RUN go install -v ./...
+```
+### 构建流程
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                              ONBUILD 构建流程                                        │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  Step 1: docker build 使用 bkeadm/Dockerfile                                        │
+│          │                                                                          │
+│          ▼                                                                          │
+│  Step 2: FROM cr.openfuyao.cn/openfuyao/builder/golang:1.24.5 AS build              │
+│          │                                                                          │
+│          │  ┌─────────────────────────────────────────────────────────────────────┐ │
+│          │  │ builder 镜像内部的 ONBUILD 指令被触发:                               │ │
+│          │  │                                                                     │ │
+│          │  │  ONBUILD COPY . /go/src/app         ← 复制源代码                    │ │
+│          │  │  ONBUILD WORKDIR /go/src/app        ← 设置工作目录                  │ │
+│          │  │  ONBUILD RUN go install -v ./...    ← 自动执行 go build             │ │
+│          │  │                                                                     │ │
+│          │  │  编译参数通过 ARG 传入:                                              │ │
+│          │  │  - GOFLAGS (编译标签)                                               │ │
+│          │  │  - GOLDFLAGS (版本信息注入)                                         │ │
+│          │  └─────────────────────────────────────────────────────────────────────┘ │
+│          │                                                                          │
+│          ▼                                                                          │
+│  Step 3: 编译完成，生成 /go/bin/app                                                  │
+│          │                                                                          │
+│          ▼                                                                          │
+│  Step 4: FROM scratch AS release                                                    │
+│          COPY --from=build /go/bin/app ./bkeadm                                     │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+### 对比：显式构建 vs ONBUILD
+#### 显式构建方式
+```dockerfile
+FROM golang:1.24.5 AS build
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -o /go/bin/app .
+
+FROM scratch AS release
+COPY --from=build /go/bin/app ./bkeadm
+```
+#### ONBUILD 方式
+```dockerfile
+ARG BUILDER_IMAGE=cr.openfuyao.cn/openfuyao/builder/golang:1.24.5
+FROM $BUILDER_IMAGE AS build
+
+FROM scratch AS release
+COPY --from=build /go/bin/app ./bkeadm
+```
+### 参数传递机制
+构建参数通过 `ARG` 传递给 ONBUILD 构建过程：
+```dockerfile
+# 定义构建参数
+ARG COMMIT
+ARG VERSION
+ARG TARGETPLATFORM
+ARG SOURCE_DATE_EPOCH
+ARG GOFLAGS='-tags=osusergo,netgo,remote,...'
+ARG GOLDFLAGS="-X gopkg.openfuyao.cn/bkeadm/utils/version.GitCommitID=$COMMIT ..."
+
+# 这些参数会被 ONBUILD RUN go install 使用
+FROM $BUILDER_IMAGE AS build
+```
+### 构建命令示例
+```bash
+docker buildx build . -f build/Dockerfile \
+    --platform=linux/amd64,linux/arm64 \
+    --build-arg=COMMIT=$(git rev-parse HEAD) \
+    --build-arg=VERSION=v1.0.0 \
+    --build-arg=SOURCE_DATE_EPOCH=$(date +%s) \
+    -t cr.openfuyao.cn/openfuyao/bkeadm:v1.0.0
+```
+### ONBUILD 的优缺点
+| 优点 | 缺点 |
+|------|------|
+| Dockerfile 简洁 | 构建过程不透明 |
+| 统一构建标准 | 调试困难 |
+| 减少重复代码 | 灵活性降低 |
+| 版本一致性 | 依赖 builder 镜像维护 |
+### 总结
+**`go build` 是在 builder 镜像的 `ONBUILD` 指令中自动执行的**，而不是在 bkeadm 的 Dockerfile 中显式定义。这种设计模式使得 Dockerfile 非常简洁，但需要理解 ONBUILD 机制才能明白构建过程。
+        
 # bkeadm Docker 镜像构建设计
 ## 一、概述
 bkeadm 提供两种类型的 Docker 镜像构建：
