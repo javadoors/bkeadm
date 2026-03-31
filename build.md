@@ -550,4 +550,310 @@ jobs:
 | **大小** | ~30MB | ~2GB+ |
 | **用途** | CLI 工具分发 | 离线环境部署 |
 | **多架构** | amd64, arm64 | amd64, arm64 |
-        
+
+# bkeadm构建命令指南
+## 一、本地构建命令
+### 1.1 基本构建
+```bash
+# 构建当前平台的二进制文件
+make build
+
+# 或者直接使用go build
+go build -ldflags="-s -w \
+  -X main.gitCommitId=$(git rev-parse HEAD) \
+  -X main.architecture=$(go env GOHOSTOS)/$(go env GOHOSTARCH) \
+  -X main.timestamp=$(date "+%Y-%m-%d") \
+  -X main.ver=v1.0.0" \
+  -o bin/bke .
+```
+### 1.2 多架构构建
+```bash
+# 构建amd64和arm64架构的二进制文件
+make release
+
+# 或者单独构建特定架构
+make docker-build ARCH=amd64
+make docker-build ARCH=arm64
+```
+### 1.3 测试构建
+```bash
+# 运行测试
+make test
+
+# 或者
+go test .
+```
+### 1.4 清理构建产物
+```bash
+# 清理所有构建产物
+make clean
+```
+## 二、Docker构建命令
+### 2.1 构建Docker镜像
+```bash
+# 构建并推送Docker镜像
+make docker
+
+# 或者手动构建
+docker build -t registry.cn-hangzhou.aliyuncs.com/bocloud/bkeadm:latest .
+docker push registry.cn-hangzhou.aliyuncs.com/bocloud/bkeadm:latest
+```
+### 2.2 使用Docker容器构建二进制
+```bash
+# 使用Docker容器构建amd64架构
+ARCH=amd64 COMMIT_ID=$(git rev-parse HEAD) VERSION=v1.0.0 TIMESTAMP=$(date "+%Y-%m-%d") \
+  build/run-in-docker.sh build/build.sh
+
+# 使用Docker容器构建arm64架构
+ARCH=arm64 COMMIT_ID=$(git rev-parse HEAD) VERSION=v1.0.0 TIMESTAMP=$(date "+%Y-%m-%d") \
+  build/run-in-docker.sh build/build.sh
+```
+### 2.3 多架构Docker镜像构建
+```bash
+# 初始化buildx环境
+make buildx
+
+# 构建多架构镜像
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  --build-arg COMMIT=$(git rev-parse HEAD) \
+  --build-arg VERSION=v1.0.0 \
+  --build-arg SOURCE_DATE_EPOCH=$(date +%s) \
+  -t registry.cn-hangzhou.aliyuncs.com/bocloud/bkeadm:v1.0.0 \
+  --push \
+  .
+```
+## 三、详细构建参数说明
+### 3.1 构建参数
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `COMMIT_ID` | Git提交ID | `git rev-parse HEAD` |
+| `VERSION` | 版本号 | `v1.0.0` |
+| `TIMESTAMP` | 构建时间戳 | `date "+%Y-%m-%d"` |
+| `ARCH` | 目标架构 | `amd64` 或 `arm64` |
+| `GOLANG` | Go版本 | `1.19.x` |
+### 3.2 构建标签
+```bash
+# 构建时使用的标签
+-tags "remote exclude_graphdriver_btrfs btrfs_noversion exclude_graphdriver_devicemapper containers_image_openpgp"
+```
+### 3.3 链接器参数
+```bash
+# LDFLAGS参数
+-ldflags="-s -w \
+  -X main.gitCommitId=<commit-id> \
+  -X main.architecture=<os>/<arch> \
+  -X main.timestamp=<timestamp> \
+  -X main.ver=<version>"
+```
+## 四、完整构建示例
+### 4.1 本地开发构建
+```bash
+#!/bin/bash
+set -e
+
+# 设置构建参数
+export COMMIT_ID=$(git rev-parse HEAD)
+export VERSION="v1.0.0"
+export TIMESTAMP=$(date "+%Y-%m-%d")
+export ARCH=$(go env GOARCH)
+
+# 构建二进制
+echo "Building bkeadm for ${ARCH}..."
+CGO_ENABLED=0 GOARCH=${ARCH} go build \
+  -tags "remote exclude_graphdriver_btrfs btrfs_noversion exclude_graphdriver_devicemapper containers_image_openpgp" \
+  -ldflags="-s -w \
+    -X main.gitCommitId=${COMMIT_ID} \
+    -X main.architecture=$(go env GOHOSTOS)/$(go env GOHOSTARCH) \
+    -X main.timestamp=${TIMESTAMP} \
+    -X main.ver=${VERSION}" \
+  -o bin/bke_${ARCH} .
+
+echo "Build completed: bin/bke_${ARCH}"
+```
+### 4.2 Docker镜像构建
+```bash
+#!/bin/bash
+set -e
+
+# 设置构建参数
+export COMMIT=$(git rev-parse HEAD)
+export VERSION="v1.0.0"
+export SOURCE_DATE_EPOCH=$(date +%s)
+
+# 构建多架构镜像
+echo "Building multi-arch Docker image..."
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  --build-arg COMMIT=${COMMIT} \
+  --build-arg VERSION=${VERSION} \
+  --build-arg SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} \
+  -t registry.cn-hangzhou.aliyuncs.com/bocloud/bkeadm:${VERSION} \
+  -t registry.cn-hangzhou.aliyuncs.com/bocloud/bkeadm:latest \
+  --push \
+  .
+
+echo "Docker image pushed: registry.cn-hangzhou.aliyuncs.com/bocloud/bkeadm:${VERSION}"
+```
+### 4.3 在线安装包构建
+```bash
+#!/bin/bash
+set -e
+
+# 构建在线安装包镜像
+echo "Building online installer image..."
+docker build \
+  -f build/Dockerfile.online \
+  -t registry.cn-hangzhou.aliyuncs.com/bocloud/bkeadm-online:latest \
+  .
+
+docker push registry.cn-hangzhou.aliyuncs.com/bocloud/bkeadm-online:latest
+
+echo "Online installer image pushed"
+```
+## 五、构建输出
+### 5.1 本地构建输出
+```
+bin/
+├── bke           # 当前平台二进制
+├── bke_amd64     # amd64架构二进制
+└── bke_arm64     # arm64架构二进制
+```
+### 5.2 Docker镜像输出
+```
+registry.cn-hangzhou.aliyuncs.com/bocloud/bkeadm:v1.0.0
+registry.cn-hangzhou.aliyuncs.com/bocloud/bkeadm:latest
+registry.cn-hangzhou.aliyuncs.com/bocloud/bkeadm-online:latest
+```
+## 六、常见问题
+### 6.1 多架构构建问题
+```bash
+# 如果遇到多架构构建问题,需要初始化buildx
+make buildx
+
+# 或者手动初始化
+docker run --privileged --rm tonistiigi/binfmt --uninstall qemu-*
+docker run --privileged --rm tonistiigi/binfmt --install all
+docker buildx create --use --name mybuilder
+docker buildx inspect mybuilder --bootstrap
+```
+### 6.2 依赖下载问题
+```bash
+# 设置Go代理
+export GOPROXY="https://goproxy.cn,direct"
+
+# 或者使用Docker构建时设置
+docker run \
+  -e GOPROXY="https://goproxy.cn,direct" \
+  ...
+```
+### 6.3 权限问题
+```bash
+# 确保输出目录权限正确
+mkdir -p bin
+chmod 755 bin
+```
+## 七、CI/CD集成示例
+### 7.1 GitLab CI示例
+```yaml
+# .gitlab-ci.yml
+stages:
+  - build
+  - docker
+
+variables:
+  VERSION: "v1.0.0"
+
+build:
+  stage: build
+  image: golang:1.24.5
+  script:
+    - make build
+  artifacts:
+    paths:
+      - bin/bke
+    expire_in: 1 week
+
+docker:
+  stage: docker
+  image: docker:latest
+  services:
+    - docker:dind
+  script:
+    - docker login -u $REGISTRY_USER -p $REGISTRY_PASSWORD registry.cn-hangzhou.aliyuncs.com
+    - docker build -t registry.cn-hangzhou.aliyuncs.com/bocloud/bkeadm:$VERSION .
+    - docker push registry.cn-hangzhou.aliyuncs.com/bocloud/bkeadm:$VERSION
+  only:
+    - main
+```
+### 7.2 GitHub Actions示例
+```yaml
+# .github/workflows/build.yml
+name: Build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.24.5'
+    
+    - name: Build
+      run: make build
+    
+    - name: Upload artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: bke
+        path: bin/bke
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'push'
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v2
+    
+    - name: Login to Registry
+      uses: docker/login-action@v2
+      with:
+        registry: registry.cn-hangzhou.aliyuncs.com
+        username: ${{ secrets.REGISTRY_USER }}
+        password: ${{ secrets.REGISTRY_PASSWORD }}
+    
+    - name: Build and push
+      uses: docker/build-push-action@v4
+      with:
+        context: .
+        platforms: linux/amd64,linux/arm64
+        push: true
+        tags: |
+          registry.cn-hangzhou.aliyuncs.com/bocloud/bkeadm:latest
+          registry.cn-hangzhou.aliyuncs.com/bocloud/bkeadm:${{ github.sha }}
+        build-args: |
+          COMMIT=${{ github.sha }}
+          VERSION=v1.0.0
+          SOURCE_DATE_EPOCH=${{ github.event.head_commit.timestamp }}
+```
+## 八、总结
+本指南提供了bkeadm的完整构建命令,包括:
+1. **本地构建**: 使用Makefile或直接使用go build命令
+2. **Docker构建**: 使用Dockerfile和buildx构建多架构镜像
+3. **构建参数**: 详细的构建参数说明
+4. **CI/CD集成**: GitLab CI和GitHub Actions示例
+
+通过这些命令,您可以轻松构建和部署bkeadm工具。
+                
