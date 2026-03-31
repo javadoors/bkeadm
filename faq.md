@@ -884,3 +884,157 @@ bkeadm提供了完整的Kubernetes集群生命周期管理能力,包括:
 
 通过这些命令,用户可以轻松完成Kubernetes集群的全生命周期管理。
 
+
+          
+# 解释bkeadm的几个参数：`--onlineImage`、`--otherRepo`、`--otherSource`、`--otherChart`。
+## 参数详解
+### 1. `--onlineImage` - 在线安装镜像地址
+**作用**：指定在线安装时使用的镜像仓库地址
+
+**使用场景**：
+- 在线安装场景（有外网访问）
+- 从远程镜像仓库拉取镜像
+
+**优先级逻辑**（见 [repository.go:236-247](file:///d:/code/github/bkeadm/pkg/initialize/repository/repository.go#L236-L247)）：
+```go
+if localImage != "" {
+    image = utils.DefaultLocalImageRegistry
+} else if otherRepo != "" {
+    image = fmt.Sprintf("%s%s", otherRepo, utils.DefaultLocalImageRegistry)
+} else if onlineImage == "" {
+    // onlineImage 为空（离线场景），使用本地镜像
+    image = utils.DefaultLocalImageRegistry
+} else {
+    // 默认使用第三方镜像
+    image = fmt.Sprintf("%s/%s", utils.DefaultThirdMirror, utils.DefaultLocalImageRegistry)
+}
+```
+
+**示例**：
+```bash
+--onlineImage registry.example.com/openfuyao/image:v1.0.0
+```
+### 2. `--otherRepo` - 外部镜像仓库地址
+**作用**：指定外部私有镜像仓库的地址前缀
+
+**使用场景**：
+- 使用企业内部私有镜像仓库
+- 需要从指定仓库同步镜像到本地
+- 优先级高于 `onlineImage`
+
+**优先级**：`localImage > otherRepo > onlineImage`
+
+**实现逻辑**（见 [repository.go:236-247](file:///d:/code/github/bkeadm/pkg/initialize/repository/repository.go#L236-L247)）：
+- 用于 `ContainerServer`（镜像仓库服务）
+- 用于 `YumServer`（YUM源服务）
+- 用于 `ChartServer`（Chart仓库服务）
+- 用于 `NFSServer`（NFS服务）
+
+**示例**：
+```bash
+--otherRepo registry.internal.company.com/
+```
+
+**解析逻辑**（见 [online.go:55-80](file:///d:/code/github/bkeadm/pkg/initialize/repository/online.go#L55-L80)）：
+```go
+if len(repo) > 0 {
+    o.Repo = repo
+    repos := strings.Split(repo, "/")
+    repos2 := strings.Split(repos[0], ":")
+    if net.ParseIP(repos2[0]) != nil {
+        o.RepoIP = repos2[0]
+        o.Repo = strings.Replace(o.Repo, o.RepoIP, domain, -1)
+        o.Image = strings.Replace(o.Image, o.RepoIP, domain, -1)
+    }
+}
+```
+### 3. `--otherSource` - 外部YUM源地址
+**作用**：指定外部YUM源（HTTP服务器）地址，用于下载系统包和运行时文件
+
+**使用场景**：
+- 从HTTP服务器下载运行时文件（containerd、CNI插件、kubectl）
+- 下载Chart包和NFS数据包
+
+**实现逻辑**（见 [online.go:97-111](file:///d:/code/github/bkeadm/pkg/initialize/repository/online.go#L97-L111)）：
+```go
+func SourceInit(oc OtherRepo) error {
+    if len(oc.Source) == 0 {
+        return nil
+    }
+    err := sourceBaseFile(oc.Source)  // 下载chart和nfs数据包
+    err = sourceRuntime(oc.Source)     // 下载containerd、cni、kubectl
+    return nil
+}
+```
+**下载内容**：
+- `charts.tar.gz` - Helm Chart包
+- `nfsshare.tar.gz` - NFS共享数据
+- `containerd-*.tar.gz` - Containerd运行时
+- `cni-plugins-*.tgz` - CNI插件
+- `kubectl` - Kubernetes命令行工具
+
+**示例**：
+```bash
+--otherSource http://repo.internal.company.com/openfuyao
+```
+### 4. `--otherChart` - 外部Chart仓库地址
+**作用**：指定外部Helm Chart仓库地址
+
+**使用场景**：
+- 使用企业内部私有Helm Chart仓库
+- 从指定Chart仓库同步Chart包
+
+**解析逻辑**（见 [online.go:81-99](file:///d:/code/github/bkeadm/pkg/initialize/repository/online.go#L81-L99)）：
+```go
+if len(chartRepo) > 0 {
+    o.ChartRepo = chartRepo
+    repos := strings.Split(chartRepo, "/")
+    repos2 := strings.Split(repos[0], ":")
+    if net.ParseIP(repos2[0]) != nil {
+        o.ChartRepoIP = repos2[0]
+        o.ChartRepo = strings.Replace(o.ChartRepo, o.ChartRepoIP, domain, -1)
+    }
+    if !strings.HasSuffix(o.ChartRepo, "/") {
+        o.ChartRepo = o.ChartRepo + "/"
+    }
+}
+```
+**示例**：
+```bash
+--otherChart chart.internal.company.com/
+```
+## 参数优先级总结
+
+| 场景 | 参数组合 | 行为 |
+|------|----------|------|
+| **离线安装** | 所有参数为空 | 使用本地镜像和本地数据包 |
+| **在线安装** | `--onlineImage` | 从指定镜像仓库拉取镜像 |
+| **私有仓库** | `--otherRepo` | 从私有镜像仓库同步镜像 |
+| **混合模式** | `--otherRepo` + `--otherSource` | 镜像从私有仓库，运行时文件从HTTP服务器 |
+| **完全自定义** | 所有参数组合 | 按优先级使用各参数 |
+
+**优先级**：`localImage > otherRepo > onlineImage > 默认值`
+## 典型使用示例
+### 离线安装
+```bash
+bkeadm init --file config.yaml
+```
+### 在线安装
+```bash
+bkeadm init --onlineImage registry.example.com/openfuyao:v1.0.0
+```
+### 使用私有仓库
+```bash
+bkeadm init \
+  --otherRepo registry.internal.company.com/ \
+  --otherSource http://repo.internal.company.com/openfuyao \
+  --otherChart chart.internal.company.com/
+```
+### 混合模式
+```bash
+bkeadm init \
+  --onlineImage registry.example.com/openfuyao:v1.0.0 \
+  --otherSource http://repo.internal.company.com/openfuyao
+```
+
+
