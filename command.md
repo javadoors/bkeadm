@@ -537,5 +537,1077 @@ graph TB
     B3 --> C1
 ```
 
+# `bkeadm bke build online-image` 详细设计
+## 1. 功能概述
+`bke build online-image` 命令用于构建一个**在线安装镜像**，将 BKE 安装所需的所有依赖包、二进制文件打包成一个 Docker 镜像并推送到镜像仓库。该镜像可用于在线安装场景。
+## 2. 命令定义
+**入口文件**: [cmd/build.go](file:///D:/code/github/bkeadm/cmd/build.go#L98-L120)
+```go
+var onlineCmd = &cobra.Command{
+    Use:   "online-image",
+    Short: "Compile an image installed online",
+    Long:  `Compile an image installed online`,
+    Example: `
+# 编译在线安装镜像
+bke build online-image -f bke.yaml -t cr.openfuyao.cn/openfuyao/bke-online-installed:latest
+
+# 编译多架构镜像 (默认架构为 amd64)
+bke build online-image -f bke.yaml --arch amd64,arm64 -t cr.openfuyao.cn/openfuyao/bke-online-installed:latest
+`,
+}
+```
+### 参数说明
+| 参数 | 简写 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `--file` | `-f` | 是 | - | 配置文件路径 |
+| `--target` | `-t` | 是 | - | 目标镜像地址 |
+| `--arch` | | 否 | 当前系统架构 | 支持多架构，如 `amd64,arm64` |
+| `--strategy` | | 否 | `registry` | 镜像同步策略 (registry/docker) |
+
+## 3. 核心实现
+**实现文件**: [pkg/build/onlineimage.go](file:///D:/code/github/bkeadm/pkg/build/onlineimage.go)
+### 3.1 执行流程
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    BuildOnlineImage()                        │
+├─────────────────────────────────────────────────────────────┤
+│  Step 1: 配置文件检查                                        │
+│    └─ 读取并解析 YAML 配置文件                               │
+├─────────────────────────────────────────────────────────────┤
+│  Step 2: 创建工作空间                                        │
+│    └─ 在当前目录创建 packages/ 目录结构                       │
+├─────────────────────────────────────────────────────────────┤
+│  Step 3: 收集依赖包和文件                                    │
+│    ├─ 下载二进制文件                       │
+│    ├─ 下载 Charts 包                                         │
+│    ├─ 下载补丁文件                          │
+│    └─ 打包为 source.tar.gz                                   │
+├─────────────────────────────────────────────────────────────┤
+│  Step 4: 构建镜像                                            │
+│    ├─ 单架构: docker build + docker push                     │
+│    └─ 多架构: docker buildx build --push                     │
+├─────────────────────────────────────────────────────────────┤
+│  Step 5: 清理临时文件                                        │
+└─────────────────────────────────────────────────────────────┘
+```
+### 3.2 关键代码逻辑
+#### 环境检查
+```go
+if !infrastructure.IsDocker() {
+    log.BKEFormat(log.ERROR, "This build instruction only supports running in docker environment.")
+    return
+}
+```
+**限制**: 必须在 Docker 环境中运行。
+#### 镜像构建策略
+**单架构构建** (架构匹配且不含逗号):
+```bash
+docker build -t <image_name> .
+docker push <image_name>
+```
+
+**多架构构建** (使用 buildx):
+```bash
+docker buildx build --platform=linux/amd64,linux/arm64 -t <image_name> . --push
+```
+### 3.3 Dockerfile 模板
+```dockerfile
+FROM scratch
+COPY source.tar.gz /bkesource/source.tar.gz
+```
+生成的镜像极其精简，仅包含一个 `source.tar.gz` 文件。
+## 4. 配置文件结构
+**配置定义**: [pkg/build/config.go](file:///D:/code/github/bkeadm/pkg/build/config.go#L24-L42)
+```yaml
+registry:
+  imageAddress: cr.openfuyao.cn/openfuyao/registry:2.8.1
+  architecture:
+    - amd64
+    - arm64
+
+repos:          # 镜像仓库配置
+  - architecture:
+      - amd64
+      - arm64
+    needDownload: true
+    subImages:
+      - sourceRepo: cr.openfuyao.cn/openfuyao
+        targetRepo: kubernetes
+        images:
+          - name: registry
+            tag: ["2.8.1"]
+
+rpms: []        # RPM 包配置
+debs: []        # DEB 包配置
+
+files:          # 二进制文件下载配置
+  - address: https://openfuyao.obs.cn-north-4.myhuaweicloud.com/...
+    files:
+      - fileName: kubectl-v1.33.1-amd64
+        fileAlias: ""
+
+charts: []      # Helm Charts 配置
+patches: []     # 补丁文件配置
+```
+### 配置项说明
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `registry` | struct | 镜像仓库配置 |
+| `repos` | []Repo | 需要同步的镜像列表 |
+| `rpms` | []Rpm | RPM 依赖包配置 |
+| `debs` | []Deb | DEB 依赖包配置 |
+| `files` | []File | 需要下载的二进制文件 |
+| `charts` | []File | Helm Charts 包 |
+| `patches` | []File | 补丁文件 |
+## 5. 工作空间目录结构
+**定义文件**: [pkg/build/prepare.go](file:///D:/code/github/bkeadm/pkg/build/prepare.go#L35-L53)
+```
+packages/
+├── bke/
+│   ├── manifests.yaml
+│   └── volumes/
+│       └── source.tar.gz      # 最终打包的内容
+├── usr/
+│   └── bin/
+│       └── bke                # bke 二进制文件
+└── tmp/
+    ├── registry/
+    └── packages/
+        ├── files/             # 下载的二进制文件
+        │   └── patches/       # 补丁文件
+        └── charts/            # Charts 包
+```
+## 6. 文件下载流程
+**实现文件**: [pkg/build/sources.go](file:///D:/code/github/bkeadm/pkg/build/sources.go)
+```go
+func buildRpms(cfg *BuildConfig, stopChan <-chan struct{}) error {
+    // 1. 下载文件
+    err := downloadFile(cfg, stopChan)
+    
+    // 2. 文件版本适配
+    err = fileVersionAdaptation()
+    
+    // 3. 重构 charts.tar.gz
+    err = buildFileChart()
+    
+    // 4. 解压 rpm.tar.gz
+    err = buildFileRpm()
+    
+    // 5. 同步 RPM 包
+    for _, rpm := range cfg.Rpms {
+        err := syncPackage(url, rpm.System, rpm.SystemVersion, ...)
+    }
+    
+    // 6. 打包为 source.tar.gz
+    err = global.TarGZ(tmpPackages, fmt.Sprintf("%s/%s", bke, utils.SourceDataFile))
+}
+```
+## 7. 与 `bke build` 的区别
+| 特性 | `bke build` | `bke build online-image` |
+|------|-------------|--------------------------|
+| 输出产物 | tar.gz 压缩包 | Docker 镜像 |
+| 镜像处理 | 打包到 `image.tar.gz` | 不包含镜像 |
+| 使用场景 | 离线安装 | 在线安装 |
+| 推送目标 | 本地文件 | 镜像仓库 |
+| 执行步骤 | 8 步 | 5 步 |
+## 8. 示例配置
+参考 [assets/online-artifacts.yaml](file:///D:/code/github/bkeadm/assets/online-artifacts.yaml):
+```yaml
+files:
+  - address: https://openfuyao.obs.cn-north-4.myhuaweicloud.com/kubernetes/kubernetes/releases/download/of-v1.33.1/bin/linux/amd64/
+    files:
+      - kubectl-v1.33.1-amd64
+      - kubelet-v1.33.1-amd64
+  - address: https://openfuyao.obs.cn-north-4.myhuaweicloud.com/containerd/containerd/releases/download/v2.1.1-origin/
+    files:
+      - containerd-v2.1.1-linux-amd64.tar.gz
+      - containerd-v2.1.1-linux-arm64.tar.gz
+```
+## 9. 使用流程
+```bash
+# 1. 准备配置文件
+bke build config > bke.yaml
+
+# 2. 编辑配置文件 (添加需要的文件、镜像等)
+
+# 3. 构建并推送镜像
+bke build online-image -f bke.yaml -t cr.openfuyao.cn/openfuyao/bke-online:v1.0.0
+
+# 4. 多架构构建
+bke build online-image -f bke.yaml --arch amd64,arm64 -t cr.openfuyao.cn/openfuyao/bke-online:v1.0.0
+```
+
+# `bkeadm bke build` 详细设计
+## 1. 功能概述
+`bke build` 命令用于构建 **BKE 离线安装包**，将 Kubernetes 集群安装所需的所有依赖（镜像、二进制文件、RPM/DEB 包、Charts 等）打包成一个完整的 tar.gz 压缩包，支持在无网络环境下进行离线安装。
+## 2. 命令定义
+**入口文件**: [cmd/build.go](file:///D:/code/github/bkeadm/cmd/build.go#L30-L54)
+```go
+var buildCmd = &cobra.Command{
+    Use:   "build",
+    Short: "Build the BKE installation package.",
+    Long:  `Build the BKE installation package.`,
+    Example: `
+# Build the BKE installation package.
+bke build -f bke.yaml -t bke.tar.gz
+`,
+}
+```
+### 参数说明
+| 参数 | 简写 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `--file` | `-f` | 是 | - | 配置文件路径 |
+| `--target` | `-t` | 否 | 自动生成 | 输出文件路径 |
+| `--strategy` | | 否 | `registry` | 镜像同步策略 |
+| `--arch` | | 否 | 当前系统架构 | 目标架构 |
+### 自动生成文件名规则
+```go
+bke-{version}-{configName}-{arch}-{timestamp}.tar.gz
+// 示例: bke-v1.33.1-bke-amd64-arm64-20250401120000.tar.gz
+```
+## 3. 核心实现
+**实现文件**: [pkg/build/build.go](file:///D:/code/github/bkeadm/pkg/build/build.go)
+### 3.1 整体执行流程
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           Build() 主流程                                 │
+├─────────────────────────────────────────────────────────────────────────┤
+│  Step 1: 配置文件检查                                                    │
+│    └─ loadAndVerifyBuildConfig() 读取并验证 YAML 配置                    │
+├─────────────────────────────────────────────────────────────────────────┤
+│  Step 2: 创建工作空间                                                    │
+│    └─ prepareBuildWorkspace() 创建 packages/ 目录结构                    │
+├─────────────────────────────────────────────────────────────────────────┤
+│  Step 3-6: 并行收集依赖 (两个 goroutine)                                 │
+│    ├─ Goroutine A: collectRpmsAndBinary()                               │
+│    │   ├─ Step 3: 收集 RPM 包和二进制文件                                │
+│    │   └─ Step 4: 收集 bke 二进制文件并获取版本号                         │
+│    └─ Goroutine B: collectRegistryImages()                              │
+│        ├─ Step 5: 构建本地镜像仓库                                       │
+│        └─ Step 6: 同步源仓库镜像到目标仓库                                │
+├─────────────────────────────────────────────────────────────────────────┤
+│  Step 7: 打包最终产物                                                    │
+│    └─ createFinalPackage() 生成 tar.gz 压缩包                            │
+├─────────────────────────────────────────────────────────────────────────┤
+│  Step 8: 完成输出                                                        │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+### 3.2 核心代码结构
+```go
+func (o *Options) Build() {
+    // Step 1: 配置文件检查
+    cfg, err := loadAndVerifyBuildConfig(o.File)
+    
+    // Step 2: 创建工作空间
+    if err := prepareBuildWorkspace(); err != nil { return }
+    
+    // Step 3-6: 并行收集依赖和镜像
+    version, err := o.collectDependenciesAndImages(cfg)
+    
+    // Step 7: 创建最终安装包
+    if err := o.createFinalPackage(cfg, version); err != nil { return }
+    
+    // Step 8: 完成
+    log.BKEFormat("step.8", fmt.Sprintf("Packaging complete %s", o.Target))
+}
+```
+## 4. 配置文件结构
+**配置定义**: [pkg/build/config.go](file:///D:/code/github/bkeadm/pkg/build/config.go#L24-L42)
+```yaml
+registry:
+  imageAddress: hub.oepkgs.net/openfuyao/registry:2.8.1  # 本地镜像仓库镜像
+  architecture:
+    - amd64
+    - arm64
+
+openFuyaoVersion: "1.0.0"
+kubernetesVersion: "v1.33.1"
+etcdVersion: "v3.5.6"
+containerdVersion: "v2.1.1"
+
+repos:          # 镜像仓库配置
+  - architecture:
+      - amd64
+      - arm64
+    needDownload: true
+    isKubernetes: false
+    subImages:
+      - sourceRepo: cr.openfuyao.cn/openfuyao
+        targetRepo: kubernetes
+        imageTrack: ""  # 可选：动态标签追踪
+        images:
+          - name: coredns
+            tag: ["1.12.2-of.1"]
+            usedPodInfo:
+              - podPrefix: coredns
+                namespace: kube-system
+
+rpms:          # RPM 包配置
+  - address: http://127.0.0.1:40080/
+    system: ["CentOS"]
+    systemVersion: ["7", "8"]
+    systemArchitecture: ["amd64", "arm64"]
+    directory: ["docker-ce", "kubectl"]
+
+debs: []       # DEB 包配置
+
+files:         # 二进制文件下载配置
+  - address: https://openfuyao.obs.cn-north-4.myhuaweicloud.com/...
+    files:
+      - fileName: kubectl-v1.33.1-amd64
+        fileAlias: ""  # 可选：重命名
+
+charts: []     # Helm Charts 配置
+patches: []    # 补丁文件配置
+```
+### 配置项详细说明
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `registry` | struct | 本地镜像仓库配置 |
+| `registry.imageAddress` | string | Registry 镜像地址 |
+| `registry.architecture` | []string | 支持的架构列表 |
+| `repos` | []Repo | 需要同步的镜像仓库列表 |
+| `repos[].needDownload` | bool | 是否需要下载 |
+| `repos[].isKubernetes` | bool | 是否为 Kubernetes 核心组件 |
+| `repos[].subImages[].imageTrack` | string | 动态标签追踪 URL |
+| `rpms` | []Rpm | RPM 包配置 |
+| `debs` | []Deb | DEB 包配置 |
+| `files` | []File | 需要下载的二进制文件 |
+| `charts` | []File | Helm Charts 包 |
+| `patches` | []File | 补丁文件 |
+## 5. 工作空间目录结构
+**定义文件**: [pkg/build/prepare.go](file:///D:/code/github/bkeadm/pkg/build/prepare.go#L35-L53)
+```
+packages/
+├── bke/                          # BKE 安装包核心目录
+│   ├── manifests.yaml            # 配置清单文件
+│   └── volumes/
+│       ├── image.tar.gz          # 镜像数据文件
+│       ├── registry.image-amd64  # Registry 镜像文件
+│       ├── registry.image-arm64  # Registry 镜像文件
+│       └── source.tar.gz         # 源数据文件
+├── usr/
+│   └── bin/
+│       ├── bke                   # bke 主程序
+│       ├── bke_amd64             # 多架构二进制
+│       └── bke_arm64
+└── tmp/                          # 临时工作目录
+    ├── registry/                 # 镜像同步临时目录
+    │   └── oci-layout/           # OCI layout 格式目录
+    └── packages/
+        ├── files/                # 下载的二进制文件
+        │   └── patches/          # 补丁文件
+        └── charts/               # Charts 包
+            ├── CentOS/
+            │   ├── 7/
+            │   │   ├── amd64/
+            │   │   └── arm64/
+            │   └── 8/
+            │       ├── amd64/
+            │       └── arm64/
+            └── Ubuntu/
+                └── 22/
+                    ├── amd64/
+                    └── arm64/
+```
+## 6. 镜像同步策略
+`bke build` 支持三种镜像同步策略，通过 `--strategy` 参数指定：
+### 6.1 Registry 策略 (默认)
+**实现文件**: [pkg/build/registrysyncimage.go](file:///D:/code/github/bkeadm/pkg/build/registrysyncimage.go)
+
+**原理**: 启动本地 Registry 容器，使用 `skopeo` 或 `crane` 工具同步镜像。
+```go
+func syncRepo(cfg *BuildConfig, stopChan chan struct{}) error {
+    // 1. 启动本地 Registry
+    server.StartImageRegistry(utils.LocalImageRegistryName, cfg.Registry.ImageAddress, "5000", tmpRegistry)
+    
+    // 2. 遍历所有镜像仓库配置
+    for _, cr := range cfg.Repos {
+        if !cr.NeedDownload { continue }
+        processRepoImages(cr, stopChan)
+    }
+    
+    // 3. 打包镜像并清理
+    return packImageAndCleanup()
+}
+```
+**特点**:
+- 需要启动 Docker 容器
+- 支持多架构镜像同步
+- 使用 `reg.CopyRegistry()` 进行镜像复制
+### 6.2 Docker 策略
+**实现文件**: [pkg/build/transfersyncimage.go](file:///D:/code/github/bkeadm/pkg/build/transfersyncimage.go)
+
+**原理**: 使用 Docker 命令 拉取、标记、推送镜像。
+```go
+func collectRepo(cfg *BuildConfig, stopChan <-chan struct{}) error {
+    // 1. 启动本地 Registry
+    server.StartImageRegistry(...)
+    
+    // 2. 创建镜像处理通道
+    imageChan := make(chan docker.ImageRef, 100)
+    
+    // 3. 启动推送协程
+    go pushImage(imageChan, pullCompleteChan, pushCompleteChan, internalStopChan)
+    
+    // 4. 同步所有镜像
+    syncAllRepoImages(cfg, channels)
+    
+    // 5. 打包镜像
+    return packImageAndCleanup()
+}
+```
+**特点**:
+- 依赖 Docker 环境
+- 使用生产者-消费者模式并发处理
+- 支持重试机制
+### 6.3 OCI 策略
+**实现文件**: [pkg/build/ocisyncimage.go](file:///D:/code/github/bkeadm/pkg/build/ocisyncimage.go)
+
+**原理**: 使用 OCI Layout 格式存储镜像，无需 Docker/Containerd。
+```go
+func syncRepoOCI(cfg *BuildConfig, stopChan chan struct{}) error {
+    // 1. 创建 OCI Layout 目录结构
+    ociDir, err := createOCILayoutStructure()
+    
+    // 2. 统计总镜像数
+    totalImages := countTotalImages(cfg)
+    
+    // 3. 同步所有镜像到 OCI Layout
+    syncAllImagesToOCI(cfg, ociDir, stopChan, totalImages)
+    
+    // 4. 移动到 volumes 目录
+    return moveOCILayoutToVolumes(ociDir)
+}
+```
+**OCI Layout 目录结构**:
+```
+oci-layout/
+├── oci-layout           # {"imageLayoutVersion":"1.0.0"}
+├── index.json           # 镜像索引
+├── blobs/
+│   └── sha256/          # 镜像层数据
+│       ├── manifest/
+│       ├── config/
+│       └── layer/
+└── refs/                # 镜像引用
+```
+**特点**:
+- 无需 Docker 环境
+- 更轻量级
+- 支持标准 OCI 格式
+## 7. 镜像同步详细流程
+### 7.1 单架构镜像同步
+```go
+func syncSingleArchImage(source, target, arch string, srcTLSVerify bool) error {
+    imageAddress := source
+    
+    // 1. 尝试直接拉取
+    op := reg.Options{
+        MultiArch:     false,
+        SrcTLSVerify:  srcTLSVerify,
+        DestTLSVerify: false,
+        Arch:          arch,
+        Source:        imageAddress,
+        Target:        target,
+    }
+    
+    if err := reg.CopyRegistry(op); err != nil {
+        // 2. 失败则尝试添加架构后缀
+        imageAddress = imageAddress + "-" + arch
+        op.Source = imageAddress
+        return reg.CopyRegistry(op)
+    }
+    return nil
+}
+```
+### 7.2 多架构镜像同步
+```go
+func syncMultiArchImage(source, target string, arch []string, srcTLSVerify bool) error {
+    // 逐个架构拉取并创建多架构 manifest
+    return syncArchImagesAndCreateManifest(source, target, arch, srcTLSVerify)
+}
+
+func syncArchImagesAndCreateManifest(source, target string, arch []string, srcTLSVerify bool) error {
+    var img []reg.ImageArch
+    
+    for _, ar := range arch {
+        // 1. 同步单架构镜像
+        archImg, err := syncSingleArchVariant(source, target, ar, op)
+        img = append(img, archImg)
+    }
+    
+    // 2. 创建多架构 manifest
+    return reg.CreateMultiArchImage(img, target)
+}
+```
+### 7.3 镜像标签格式支持
+支持多种镜像标签格式：
+
+| 格式 | 示例 | 说明 |
+|------|------|------|
+| 标准格式 | `alpine:3.15` | 多架构镜像 |
+| 架构后缀 | `alpine:3.15-amd64` | 单架构镜像 |
+| 动态标签 | `alpine:v4.0-*-202502051112` | 使用 `-*-` 占位符 |
+
+```go
+// 动态标签处理
+if strings.Contains(tag, cut) {  // cut = "-*-"
+    imageAddress = strings.ReplaceAll(imageAddress, cut, fmt.Sprintf("-%s-", arch))
+}
+```
+## 8. 动态标签追踪
+**实现文件**: [pkg/build/repotrack.go](file:///D:/code/github/bkeadm/pkg/build/repotrack.go)
+
+支持从不同镜像仓库 API 获取最新标签：
+### 8.1 支持的仓库类型
+| 类型 | 标识 | API 格式 |
+|------|------|----------|
+| DockerHub | `dockerhub` | Docker Hub API |
+| Nexus | `nexus@http://user:pass@nexus.com/` | Nexus REST API |
+| Harbor | `harbor@http://user:pass@harbor.com/` | Harbor API v2 |
+| Registry | `registry@http://registry.com/` | Registry v2 API |
+### 8.2 使用示例
+```yaml
+subImages:
+  - sourceRepo: cr.openfuyao.cn/openfuyao
+    targetRepo: kubernetes
+    imageTrack: "harbor@http://admin:password@harbor.example.com/"
+    images:
+      - name: my-image
+        tag: ["latest"]  # 将被替换为实际最新标签
+```
+
+```go
+func imageTrack(sourceRepo, imageTrack, imageName, imageTag string, arch []string) (string, error) {
+    if len(imageTrack) == 0 || strings.Contains(imageTag, cut) {
+        // 直接使用配置的标签
+        return fmt.Sprintf("%s/%s:%s", sourceRepo, imageName, imageTag), nil
+    }
+    
+    repo, url := splitRepo1(imageTrack)
+    switch repo {
+    case DockerHub:
+        imageTagList, err = dockerHubTags(imageName)
+    case Nexus:
+        imageTagList, err = nexusTags(newUrl, imageName)
+    case Harbor:
+        imageTagList, err = harborTags(newUrl, projectName, imageName)
+    case Registry:
+        imageTagList, err = registryTags(newUrl, imageName)
+    }
+    
+    // 返回最新标签
+    return getLatestTag(imageTagList, arch)
+}
+```
+## 9. 文件下载流程
+**实现文件**: [pkg/build/sources.go](file:///D:/code/github/bkeadm/pkg/build/sources.go)
+### 9.1 下载流程
+```go
+func buildRpms(cfg *BuildConfig, stopChan <-chan struct{}) error {
+    // 1. 下载配置文件中指定的文件
+    err := downloadFile(cfg, stopChan)
+    
+    // 2. 文件版本适配 (重命名)
+    err = fileVersionAdaptation()
+    
+    // 3. 重构 charts.tar.gz
+    err = buildFileChart()
+    
+    // 4. 解压 rpm.tar.gz
+    err = buildFileRpm()
+    
+    // 5. 同步 RPM 包
+    for _, rpm := range cfg.Rpms {
+        syncPackage(url, rpm.System, rpm.SystemVersion, rpm.SystemArchitecture, rpm.Directory)
+    }
+    
+    // 6. 打包为 source.tar.gz
+    return global.TarGZ(tmpPackages, fmt.Sprintf("%s/%s", bke, utils.SourceDataFile))
+}
+```
+### 9.2 RPM 包下载
+```go
+func syncPackage(url string, systems, versions, architectures, directories []string) error {
+    for _, s := range systems {
+        for _, v := range versions {
+            for _, ar := range architectures {
+                for _, d := range directories {
+                    // 拼接下载 URL
+                    downloadUrl := fmt.Sprintf("%s%s/%s/%s/%s/", url, system, version, arch, directory)
+                    
+                    // 下载目录下所有文件
+                    utils.DownloadAllFiles(downloadUrl, downloadDirectory)
+                }
+                
+                // 创建 yum 仓库元数据
+                cmd := fmt.Sprintf("createrepo %s", path.Join(tmpPackages, system, version, arch))
+                global.Command.ExecuteCommandWithOutput("sh", "-c", cmd)
+            }
+        }
+    }
+}
+```
+### 9.3 文件下载目录结构
+```
+tmp/packages/
+├── files/
+│   ├── kubectl-v1.33.1-amd64
+│   ├── kubelet-v1.33.1-amd64
+│   ├── containerd-v2.1.1-linux-amd64.tar.gz
+│   ├── cni-plugins-linux-amd64-v1.4.1.tgz
+│   ├── helm-v3.14.2-linux-amd64.tar.gz
+│   └── patches/
+│       └── patch-v1.0.0.tar.gz
+├── charts/
+│   └── charts.tar.gz
+├── CentOS/
+│   ├── 7/
+│   │   ├── amd64/
+│   │   │   ├── docker-ce/
+│   │   │   │   └── *.rpm
+│   │   │   └── repodata/
+│   │   └── arm64/
+│   └── 8/
+│       └── ...
+└── Ubuntu/
+    └── 22/
+        └── ...
+```
+## 10. BKE 二进制处理
+**实现文件**: [pkg/build/sources.go](file:///D:/code/github/bkeadm/pkg/build/sources.go#L201-L262)
+```go
+func buildBkeBinary() (string, error) {
+    // 1. 查找 bke 二进制文件
+    bkeBinaryList, err := findBkeBinaries()
+    // 支持的命名: bke, bke_amd64, bke_arm64, bkeadm_*
+    
+    if len(bkeBinaryList) == 0 {
+        return "", errors.New("the files list must contain bke binary file")
+    }
+    
+    if len(bkeBinaryList) == 1 {
+        // 单一二进制
+        return installSingleBkeBinary(bkeBinaryList[0])
+    }
+    
+    // 多架构二进制
+    return installMultipleBkeBinaries(bkeBinaryList)
+}
+
+func installSingleBkeBinary(bkeName string) (string, error) {
+    // 1. 复制到 usr/bin/bke
+    utils.CopyFile(sourceBKE, targetBKE)
+    
+    // 2. 设置可执行权限
+    os.Chmod(targetBKE, utils.ExecutableFilePermission)
+    
+    // 3. 获取版本号
+    version, _ := global.Command.ExecuteCommandWithOutput("sh", "-c", fmt.Sprintf("%s version only", targetBKE))
+    
+    return version, nil
+}
+```
+## 11. 最终打包
+```go
+func (o *Options) createFinalPackage(cfg *BuildConfig, version string) error {
+    // 1. 生成默认文件名 (如果未指定)
+    if len(o.Target) == 0 {
+        fileInfo, _ := os.Stat(o.File)
+        o.Target = path.Join(pwd, fmt.Sprintf("bke-%s-%s-%s-%s.tar.gz", 
+            version,
+            strings.TrimSuffix(fileInfo.Name(), ".yaml"),
+            strings.Join(cfg.Registry.Architecture, "-"),
+            time.Now().Format("20060102150405")))
+    }
+    
+    // 2. 压缩打包
+    return compressedPackage(cfg, o.Target)
+}
+
+func compressedPackage(cfg *BuildConfig, target string) error {
+    // 1. 写入 manifests.yaml
+    writeManifestsFile(cfg, path.Join(bke, "manifests.yaml"))
+    
+    // 2. 删除临时目录
+    os.RemoveAll(tmp)
+    
+    // 3. 压缩打包 (保留文件权限)
+    return global.TaeGZWithoutChangeFile(packages, target)
+}
+```
+## 12. 与 `bke build online-image` 对比
+
+| 特性 | `bke build` | `bke build online-image` |
+|------|-------------|--------------------------|
+| **输出产物** | tar.gz 压缩包 | Docker 镜像 |
+| **镜像处理** | 打包到 `image.tar.gz` | 不包含镜像 |
+| **使用场景** | 离线安装 | 在线安装 |
+| **推送目标** | 本地文件系统 | 镜像仓库 |
+| **执行步骤** | 8 步 | 5 步 |
+| **环境要求** | Docker 环境 | Docker 环境 |
+| **多架构支持** | ✅ | ✅ (buildx) |
+| **镜像仓库** | 包含完整镜像仓库 | 不包含 |
+
+## 13. 使用示例
+### 13.1 生成默认配置
+```bash
+bke build config > bke.yaml
+```
+### 13.2 编辑配置文件
+```yaml
+registry:
+  imageAddress: hub.oepkgs.net/openfuyao/registry:2.8.1
+  architecture: ["amd64", "arm64"]
+
+repos:
+  - architecture: ["amd64", "arm64"]
+    needDownload: true
+    subImages:
+      - sourceRepo: cr.openfuyao.cn/openfuyao
+        targetRepo: kubernetes
+        images:
+          - name: coredns
+            tag: ["1.12.2-of.1"]
+
+files:
+  - address: https://openfuyao.obs.cn-north-4.myhuaweicloud.com/kubernetes/kubernetes/releases/download/of-v1.33.1/bin/linux/amd64/
+    files:
+      - fileName: kubectl-v1.33.1-amd64
+```
+### 13.3 构建安装包
+```bash
+# 基本构建
+bke build -f bke.yaml -t bke-v1.0.0.tar.gz
+
+# 使用 OCI 策略 (无需 Docker)
+bke build -f bke.yaml --strategy oci
+
+# 指定架构
+bke build -f bke.yaml --arch amd64,arm64
+```
+## 14. 架构图
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              bke build 架构                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────┐    ┌─────────────────────────────────────────────────┐    │
+│  │  bke.yaml   │───▶│              Build Pipeline                     │    │
+│  └─────────────┘    └─────────────────────────────────────────────────┘    │
+│                                    │                                        │
+│                                    ▼                                        │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │                        Step 1-2: 初始化                               │  │
+│  │  ┌────────────────┐    ┌────────────────┐    ┌────────────────┐     │  │
+│  │  │ 配置文件验证    │───▶│ 工作空间创建    │───▶│ 目录结构初始化  │     │  │
+│  │  └────────────────┘    └────────────────┘    └────────────────┘     │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│                                    │                                        │
+│                    ┌───────────────┴───────────────┐                       │
+│                    ▼                               ▼                       │
+│  ┌─────────────────────────────┐   ┌─────────────────────────────┐        │
+│  │   Step 3-4: 依赖收集        │   │   Step 5-6: 镜像同步        │        │
+│  │  ┌─────────────────────┐   │   │  ┌─────────────────────┐   │        │
+│  │  │ 下载二进制文件       │   │   │  │ 启动本地 Registry    │   │        │
+│  │  └─────────────────────┘   │   │  └─────────────────────┘   │        │
+│  │  ┌─────────────────────┐   │   │  ┌─────────────────────┐   │        │
+│  │  │ 下载 Charts 包       │   │   │  │ 同步源仓库镜像       │   │        │
+│  │  └─────────────────────┘   │   │  └─────────────────────┘   │        │
+│  │  ┌─────────────────────┐   │   │  ┌─────────────────────┐   │        │
+│  │  │ 同步 RPM/DEB 包      │   │   │  │ 打包镜像数据         │   │        │
+│  │  └─────────────────────┘   │   │  └─────────────────────┘   │        │
+│  │  ┌─────────────────────┐   │   │                            │        │
+│  │  │ 打包 source.tar.gz   │   │   │  策略: registry/docker/oci │        │
+│  │  └─────────────────────┘   │   │                            │        │
+│  └─────────────────────────────┘   └─────────────────────────────┘        │
+│                    └───────────────┬───────────────┘                       │
+│                                    ▼                                        │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │                        Step 7-8: 打包输出                             │  │
+│  │  ┌────────────────┐    ┌────────────────┐    ┌────────────────┐     │  │
+│  │  │ 生成 manifests  │───▶│ 清理临时文件    │───▶│ 压缩打包输出    │     │  │
+│  │  └────────────────┘    └────────────────┘    └────────────────┘     │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│                                                                             │
+│  输出: bke-{version}-{config}-{arch}-{timestamp}.tar.gz                    │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+# bke build与bke build online-image
+## 代码复用分析
+### 当前两个命令的流程对比
+| 步骤 | `bke build` | `bke build online-image` | 是否复用 |
+|------|-------------|--------------------------|----------|
+| Step 1 | 配置文件检查 | 配置文件检查 | ❌ 重复代码 |
+| Step 2 | 创建工作空间 | 创建工作空间 | ✅ 复用 `prepare()` |
+| Step 3 | 收集 RPM/文件 | 收集 RPM/文件 | ✅ 复用 `buildRpms()` |
+| Step 4 | 收集 bke 二进制 | ❌ 无 | - |
+| Step 5 | 构建镜像仓库 | ❌ 无 | - |
+| Step 6 | 同步镜像 | ❌ 无 | - |
+| Step 7 | 打包 tar.gz | 构建镜像 | ❌ 不同 |
+| Step 8 | 完成 | 完成 | - |
+
+### 当前问题
+**`online-image` 存在的问题**:
+1. 只包含 `source.tar.gz`（二进制文件、RPM 包）
+2. **不包含镜像数据** (`image.tar.gz`)
+3. **不包含 bke 二进制文件**
+4. 本质上只是一个"在线安装辅助镜像"，不是完整的离线安装包
+
+**代码重复问题**:
+```go
+// onlineimage.go - 重复代码
+cfg := &BuildConfig{}
+yamlFile, err := os.ReadFile(o.File)
+if err != nil { ... }
+if err = yaml.Unmarshal(yamlFile, cfg); err != nil { ... }
+
+// build.go - 同样的逻辑
+cfg := &BuildConfig{}
+yamlFile, err := os.ReadFile(file)
+if err != nil { ... }
+if err = yaml.Unmarshal(yamlFile, cfg); err != nil { ... }
+```
+### 优化方案
+**你的建议完全可行**：先构建离线 tar 包，再封装成镜像。
+#### 方案一：直接复用 Build() 函数
+```go
+func (o *Options) BuildOnlineImage() {
+    // 1. 先构建离线包
+    tarPath := fmt.Sprintf("bke-online-%d.tar.gz", time.Now().Unix())
+    o.Target = tarPath
+    o.Build()  // 复用完整的 Build 流程
+    
+    // 2. 将 tar 包封装成镜像
+    err := o.buildImageFromTar(tarPath)
+    if err != nil {
+        log.BKEFormat(log.ERROR, fmt.Sprintf("Build image failures %s", err.Error()))
+        return
+    }
+    
+    // 3. 清理临时文件
+    os.RemoveAll(tarPath)
+    log.BKEFormat("step.6", "Push the image to the registry completed")
+}
+
+func (o *Options) buildImageFromTar(tarPath string) error {
+    err := os.Mkdir(pwd+"/bkesource", utils.DefaultDirPermission)
+    if err != nil {
+        return err
+    }
+    defer os.RemoveAll(pwd + "/bkesource")
+    
+    dockerfile := `
+FROM scratch
+COPY bke.tar.gz /bke/bke.tar.gz
+`
+    err = os.WriteFile(pwd+"/bkesource/Dockerfile", []byte(dockerfile), utils.DefaultFilePermission)
+    if err != nil {
+        return err
+    }
+    
+    // 复制 tar 包
+    err = utils.CopyFile(tarPath, pwd+"/bkesource/bke.tar.gz")
+    if err != nil {
+        return err
+    }
+    
+    // 构建并推送镜像
+    return buildAndPushImage(o.Target, o.Arch)
+}
+```
+#### 方案二：提取公共函数
+```go
+// 提取公共的配置加载函数
+func loadBuildConfig(file string) (*BuildConfig, error) {
+    cfg := &BuildConfig{}
+    yamlFile, err := os.ReadFile(file)
+    if err != nil {
+        return nil, fmt.Errorf("failed to read file: %w", err)
+    }
+    if err = yaml.Unmarshal(yamlFile, cfg); err != nil {
+        return nil, fmt.Errorf("unable to unmarshal file: %w", err)
+    }
+    if err = verifyConfigContent(cfg); err != nil {
+        return nil, fmt.Errorf("config verification failed: %w", err)
+    }
+    return cfg, nil
+}
+
+// 提取公共的镜像构建函数
+func buildAndPushImage(imageName, arch, sourceDir string) error {
+    if strings.Contains(arch, runtime.GOARCH) && !strings.Contains(arch, ",") {
+        // 单架构构建
+        output, err := global.Command.ExecuteCommandWithOutput("sh", "-c",
+            fmt.Sprintf("cd %s && docker build -t %s .", sourceDir, imageName))
+        if err != nil {
+            return errors.New(output + err.Error())
+        }
+        output, err = global.Command.ExecuteCommandWithOutput("sh", "-c",
+            fmt.Sprintf("docker push %s", imageName))
+        if err != nil {
+            return errors.New(output + err.Error())
+        }
+    } else {
+        // 多架构构建
+        platform := buildPlatformString(arch)
+        output, err := global.Command.ExecuteCommandWithOutput("sh", "-c",
+            fmt.Sprintf("cd %s && docker buildx build --platform=%s -t %s . --push", 
+                sourceDir, platform, imageName))
+        if err != nil {
+            return errors.New(output + err.Error())
+        }
+    }
+    return nil
+}
+```
+### 优化后的架构
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      重构后的架构                                │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                    公共函数层                            │   │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  │   │
+│  │  │loadConfig()  │  │ prepare()    │  │ buildRpms()  │  │   │
+│  │  └──────────────┘  └──────────────┘  └──────────────┘  │   │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  │   │
+│  │  │buildRegistry │  │ syncRepo()   │  │buildBkeBinary│  │   │
+│  │  └──────────────┘  └──────────────┘  └──────────────┘  │   │
+│  │  ┌──────────────┐  ┌──────────────┐                    │   │
+│  │  │compressPkg() │  │buildDockerImg│                    │   │
+│  │  └──────────────┘  └──────────────┘                    │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                              │                                  │
+│              ┌───────────────┴───────────────┐                 │
+│              ▼                               ▼                  │
+│  ┌───────────────────────┐     ┌───────────────────────┐      │
+│  │     bke build         │     │  bke build online-image│      │
+│  │  ┌─────────────────┐  │     │  ┌─────────────────┐  │      │
+│  │  │ 1. loadConfig   │  │     │  │ 1. loadConfig   │  │      │
+│  │  │ 2. prepare      │  │     │  │ 2. prepare      │  │      │
+│  │  │ 3. buildRpms    │  │     │  │ 3. buildRpms    │  │      │
+│  │  │ 4. buildBkeBin  │  │     │  │ 4. buildBkeBin  │  │      │
+│  │  │ 5. buildRegistry│  │     │  │ 5. buildRegistry│  │      │
+│  │  │ 6. syncRepo     │  │     │  │ 6. syncRepo     │  │      │
+│  │  │ 7. compressPkg  │  │     │  │ 7. compressPkg  │  │      │
+│  │  │ 8. 输出 tar.gz  │  │     │  │ 8. buildDockerImg│  │      │
+│  │  └─────────────────┘  │     │  │ 9. 输出镜像     │  │      │
+│  │                        │     │  └─────────────────┘  │      │
+│  │  输出: bke.tar.gz     │     │  输出: bke:v1.0 镜像  │      │
+│  └───────────────────────┘     └───────────────────────┘      │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+### 优化收益
+| 方面 | 优化前 | 优化后 |
+|------|--------|--------|
+| **代码复用** | 部分复用 | 完全复用 |
+| **online-image 功能** | 不完整 | 完整离线包 |
+| **维护成本** | 两套逻辑 | 一套逻辑 |
+| **构建时间** | 分别构建 | 可复用缓存 |
+| **产物一致性** | 不一致 | 完全一致 |
+
+### 建议的实现
+```go
+// build.go
+func (o *Options) Build() {
+    if !infrastructure.IsDocker() {
+        log.BKEFormat(log.ERROR, "This build instruction only supports running in docker environment.")
+        return
+    }
+
+    cfg, err := loadBuildConfig(o.File)
+    if err != nil {
+        log.BKEFormat(log.ERROR, err.Error())
+        return
+    }
+
+    if err := prepareBuildWorkspace(); err != nil {
+        log.BKEFormat(log.ERROR, err.Error())
+        return
+    }
+
+    version, err := o.collectDependenciesAndImages(cfg)
+    if err != nil {
+        log.BKEFormat(log.ERROR, err.Error())
+        return
+    }
+
+    if err := o.createFinalPackage(cfg, version); err != nil {
+        log.BKEFormat(log.ERROR, err.Error())
+        return
+    }
+
+    log.BKEFormat("step.8", fmt.Sprintf("Packaging complete %s", o.Target))
+}
+
+// onlineimage.go - 重构后
+func (o *Options) BuildOnlineImage() {
+    if !infrastructure.IsDocker() {
+        log.BKEFormat(log.ERROR, "This build instruction only supports running in docker environment.")
+        return
+    }
+
+    // 1. 复用 Build() 生成离线包
+    tarPath := o.generateTempTarPath()
+    o.Target = tarPath
+    o.Build()
+    
+    // 检查 tar 包是否生成成功
+    if !utils.Exists(tarPath) {
+        log.BKEFormat(log.ERROR, "Failed to create offline package")
+        return
+    }
+
+    // 2. 将 tar 包封装成 Docker 镜像
+    log.BKEFormat("step.9", fmt.Sprintf("Build the image %s ...", o.Target))
+    if err := o.buildImageFromTar(tarPath); err != nil {
+        log.BKEFormat(log.ERROR, fmt.Sprintf("Build image failures %s", err.Error()))
+        return
+    }
+
+    // 3. 清理
+    os.RemoveAll(tarPath)
+    log.BKEFormat("step.10", "Push the image to the registry completed")
+}
+
+func (o *Options) buildImageFromTar(tarPath string) error {
+    sourceDir := path.Join(pwd, "bkesource")
+    if err := os.MkdirAll(sourceDir, utils.DefaultDirPermission); err != nil {
+        return err
+    }
+    defer os.RemoveAll(sourceDir)
+
+    // 创建 Dockerfile
+    dockerfile := `FROM scratch
+COPY bke.tar.gz /bke/bke.tar.gz
+`
+    if err := os.WriteFile(path.Join(sourceDir, "Dockerfile"), []byte(dockerfile), utils.DefaultFilePermission); err != nil {
+        return err
+    }
+
+    // 复制 tar 包
+    if err := utils.CopyFile(tarPath, path.Join(sourceDir, "bke.tar.gz")); err != nil {
+        return err
+    }
+
+    // 构建并推送镜像
+    return buildAndPushDockerImage(o.Target, o.Arch, sourceDir)
+}
+```
+### 总结
+**你的建议非常合理**，可以实现：
+1. ✅ **代码完全复用** - `online-image` 直接调用 `Build()` 函数
+2. ✅ **功能完整** - 生成的镜像包含完整的离线安装包
+3. ✅ **维护简单** - 只需维护一套构建逻辑
+4. ✅ **产物一致** - 两种方式生成的离线包内容完全一致
+
+
 这种设计确保了初始化过程的**可靠性**、**灵活性**和**可维护性**，同时支持多种部署场景。
         
