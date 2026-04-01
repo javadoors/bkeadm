@@ -1608,6 +1608,500 @@ COPY bke.tar.gz /bke/bke.tar.gz
 3. ✅ **维护简单** - 只需维护一套构建逻辑
 4. ✅ **产物一致** - 两种方式生成的离线包内容完全一致
 
-
 这种设计确保了初始化过程的**可靠性**、**灵活性**和**可维护性**，同时支持多种部署场景。
-        
+
+      # `bke build rpm` 详细设计
+## 1. 功能概述
+`bke build rpm` 命令用于构建**离线 RPM/DEB 软件包仓库**，支持为多种操作系统（CentOS、Ubuntu、Kylin）和架构创建本地 YUM/APT 软件源。生成的 `rpm.tar.gz` 可用于 BKE 离线安装场景。
+## 2. 命令定义
+**入口文件**: [cmd/build.go](file:///D:/code/github/bkeadm/cmd/build.go#L131-L156)
+```go
+var rpmCmd = &cobra.Command{
+    Use:   "rpm",
+    Short: "Build an offline rpm package",
+    Long:  `Build an offline rpm package`,
+    Example: `
+# 初始化 rpm 包
+# rpm 是一个空目录或包含多个包的源目录
+bke build rpm --source rpm
+
+# 为已存在的 rpm.tar.gz 添加新的 rpm 包
+bke build rpm --source rpm.tar.gz --add centos/8/amd64 --package docker-ce
+
+# 自定义镜像仓库
+bke build rpm --source rpm.tar.gz --add centos/8/amd64 --package docker-ce --registry cr.openfuyao.cn/openfuyao
+
+# 仅构建指定系统的 rpm
+bke build rpm --add centos/8/amd64 --package docker-ce
+`,
+}
+```
+### 参数说明
+| 参数 | 必填 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--source` | 否 | - | 源 RPM 文件路径，可以是目录或 `rpm.tar.gz` 文件 |
+| `--add` | 否 | - | 添加 RPM 包的目标系统路径，如 `centos/8/amd64` |
+| `--package` | 否 | - | 要添加的包目录路径 |
+| `--registry` | 否 | `registry.cn-hangzhou.aliyuncs.com/bocloud` | 构建镜像仓库地址 |
+### 参数校验规则
+```go
+PreRunE: func(cmd *cobra.Command, args []string) error {
+    // add 和 package 必须同时指定或同时为空
+    if (rpmOption.Add == "") != (rpmOption.Package == "") {
+        return errors.New("The parameter `add` or `package` is required. ")
+    }
+    return nil
+}
+```
+## 3. 支持的操作系统和架构
+**定义文件**: [pkg/build/buildrpm.go](file:///D:/code/github/bkeadm/pkg/build/buildrpm.go#L42-L52)
+```go
+var adds = map[string]string{
+    "centos/7/amd64":  "CentOS/7/amd64",
+    "centos/7/arm64":  "CentOS/7/arm64",
+    "centos/8/amd64":  "CentOS/8/amd64",
+    "centos/8/arm64":  "CentOS/8/arm64",
+    "ubuntu/22/amd64": "Ubuntu/22/amd64",
+    "ubuntu/22/arm64": "Ubuntu/22/arm64",
+    "kylin/v10/arm64": "Kylin/V10/arm64",
+    "kylin/v10/amd64": "Kylin/V10/amd64",
+}
+```
+
+| 操作系统 | 版本 | 架构 | 包格式 | 构建工具 |
+|----------|------|------|--------|----------|
+| CentOS | 7 | amd64, arm64 | RPM | createrepo |
+| CentOS | 8 | amd64, arm64 | RPM | createrepo + repo2module |
+| Ubuntu | 22 | amd64, arm64 | DEB | dpkg-scanpackages |
+| Kylin | V10 | amd64, arm64 | RPM | createrepo |
+## 4. 核心实现
+**实现文件**: [pkg/build/buildrpm.go](file:///D:/code/github/bkeadm/pkg/build/buildrpm.go)
+### 4.1 执行流程
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         RpmOptions.Build()                              │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  无参数时: 输出目录结构                                                   │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │  consoleOutputStruct()  # 打印 rpm 目录结构                      │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+│  参数校验:                                                               │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │  1. 验证 add 参数是否有效                                         │   │
+│  │  2. 验证 package 目录结构                                         │   │
+│  │  3. 获取 source/package 绝对路径                                  │   │
+│  │  4. 检查 Docker 环境                                              │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+│  执行构建: executeBuild()                                               │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │  场景 1: --add + --package (无 source)                           │   │
+│  │    └─ rmpBuild() → 构建单个系统的 rpm 包                          │   │
+│  │                                                                   │   │
+│  │  场景 2: --source (无 add/package)                               │   │
+│  │    └─ rpmBuildPackage() → 构建完整的 rpm.tar.gz                  │   │
+│  │                                                                   │   │
+│  │  场景 3: --source + --add + --package                            │   │
+│  │    └─ rpmPackageAddOne() → 向已有包添加新 rpm                     │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+### 4.2 三种使用场景
+#### 场景 1: 构建单个系统的 RPM 包
+```bash
+bke build rpm --add centos/8/amd64 --package ./docker-ce
+```
+
+```go
+func rmpBuild(registry string, add string, absPath string) error {
+    switch add {
+    case "centos/7/amd64", "centos/7/arm64":
+        return rpmCentos7Build(registry, absPath)
+    case "centos/8/amd64", "centos/8/arm64":
+        return rpmCentos8Build(registry, absPath)
+    case "ubuntu/22/amd64", "ubuntu/22/arm64":
+        return rpmUbuntu22Build(registry, absPath)
+    case "kylin/v10/amd64", "kylin/v10/arm64":
+        return rpmKylinV10Build(registry, absPath)
+    }
+}
+```
+#### 场景 2: 构建完整的 rpm.tar.gz
+```bash
+bke build rpm --source ./rpm
+```
+
+```go
+func rpmBuildPackage(source string, registry string) {
+    // 1. 准备工作空间
+    prepareWorkspace()
+    
+    // 2. 复制源目录到 packages
+    utils.CopyDir(source, packages)
+    
+    // 3. 为所有系统/架构构建 rpm 仓库
+    rpmBuildAllArchitectures(registry)
+    
+    // 4. 打包为 rpm.tar.gz.1
+    compressAndCleanupRpm(path.Join(pwd, "rpm.tar.gz.1"), "Build rpm success.")
+}
+```
+#### 场景 3: 向已有包添加新 RPM
+```bash
+bke build rpm --source rpm.tar.gz --add centos/8/amd64 --package ./docker-ce
+```
+
+```go
+func rpmPackageAddOne(source string, registry string, add string, pack string) {
+    // 1. 解压已有的 rpm.tar.gz
+    utils.UnTar(source, packages)
+    
+    // 2. 复制新包到目标目录
+    addList := strings.Split(adds[add], "/")  // ["CentOS", "8", "amd64"]
+    utils.CopyDir(pack, path.Join(packages, addList[0], addList[1], addList[2]))
+    
+    // 3. 重新构建该系统的 rpm 仓库
+    rmpBuild(registry, add, path.Join(packages, addList[0], addList[1], addList[2]))
+    
+    // 4. 重新打包
+    compressAndCleanupRpm(path.Join(pwd, "rpm.tar.gz.1"), "The rpm package has been successfully built")
+}
+```
+## 5. 构建实现详解
+### 5.1 CentOS 7 构建
+```go
+func rpmCentos7Build(registry string, mnt string) error {
+    return executeGenericRpmBuild(rpmBuildConfig{
+        registry:      registry,
+        mnt:           mnt,
+        image:         "centos:7-amd64-build",      // 构建镜像
+        containerName: "build-centos7-rpm",
+        cmd:           "createrepo ./",              // 构建命令
+        osInfo:        "centos/7/amd64",
+        checkFile:     "repodata",                   // 校验文件
+    })
+}
+```
+**构建流程**:
+1. 拉取 `centos:7-amd64-build` 镜像
+2. 清理旧的 `repodata` 目录
+3. 启动容器执行 `createrepo ./`
+4. 验证 `repodata` 目录是否存在
+### 5.2 CentOS 8 构建
+```go
+func rpmCentos8Build(registry string, mnt string) error {
+    // CentOS 8 需要额外的模块支持
+    cmd := "createrepo ./ && repo2module -s stable . modules.yaml && " +
+           "modifyrepo_c --mdtype=modules modules.yaml repodata/"
+    
+    return executeGenericRpmBuild(rpmBuildConfig{
+        registry:      registry,
+        mnt:           mnt,
+        image:         "centos:8-amd64-build",
+        containerName: "build-centos8-rpm",
+        cmd:           cmd,
+        osInfo:        "centos/8/amd64",
+        checkFile:     "modules.yaml",  // 需要校验 modules.yaml
+    })
+}
+```
+**CentOS 8 特殊处理**:
+```go
+func cleanCentos8Modules(mnt string) error {
+    // 清理旧的模块文件
+    for _, f := range []string{"modules.yaml", "repodata", ".repodata"} {
+        os.RemoveAll(path.Join(mnt, f))
+    }
+    // 清理子目录中的模块文件
+    for _, entry := range entries {
+        for _, f := range []string{"modules.yaml", "repodata"} {
+            os.RemoveAll(path.Join(mnt, entry.Name(), f))
+        }
+    }
+}
+```
+### 5.3 Ubuntu 22 构建
+```go
+func rpmUbuntu22Build(registry string, mnt string) error {
+    image := registry + "/ubuntu:22-amd64-build"
+    
+    // 清理旧的 Packages.gz
+    os.RemoveAll(path.Join(mnt, "Packages.gz"))
+    os.RemoveAll(path.Join(mnt, "archives", "Packages.gz"))
+    
+    // 启动容器执行 dpkg-scanpackages
+    runBuildContainer(image, mnt, "build-ubuntu22-rpm",
+        "dpkg-scanpackages -m . /dev/null | gzip -9c > Packages.gz && cp Packages.gz ./archives")
+    
+    // 验证 Packages.gz 是否存在
+    if !utils.Exists(path.Join(mnt, "Packages.gz")) {
+        return errors.New("packages.gz not found")
+    }
+}
+```
+### 5.4 Kylin V10 构建
+```go
+func rpmKylinV10Build(registry string, mnt string) error {
+    // Kylin V10 使用与 CentOS 7 相同的构建方式
+    return executeGenericRpmBuild(rpmBuildConfig{
+        registry:      registry,
+        mnt:           mnt,
+        image:         "centos:7-amd64-build",
+        containerName: "build-kylin10-rpm",
+        cmd:           "createrepo ./",
+        osInfo:        "kylin/v10/amd64",
+        checkFile:     "repodata",
+    })
+}
+```
+## 6. 通用构建流程
+```go
+func executeGenericRpmBuild(cfg rpmBuildConfig) error {
+    // 1. 检查目录是否为空
+    if utils.DirectoryIsEmpty(cfg.mnt) {
+        return nil
+    }
+
+    // 2. 确保构建镜像存在
+    image, err := ensureRpmBuildImage(cfg.registry, cfg.image)
+    if err != nil {
+        return err
+    }
+
+    // 3. 清理旧的仓库元数据
+    if err := cleanRepodata(cfg.mnt); err != nil {
+        return err
+    }
+
+    // 4. 执行构建容器
+    if err := executeRpmBuildContainer(image, cfg.mnt, cfg.containerName, cfg.cmd); err != nil {
+        return err
+    }
+
+    // 5. 验证构建结果
+    return verifyRpmBuildResult(cfg.mnt, cfg.osInfo, cfg.checkFile)
+}
+```
+### 6.1 容器执行流程
+```go
+func executeRpmBuildContainer(image, mnt, containerName, cmd string) error {
+    // 1. 移除同名容器（如果存在）
+    global.Docker.ContainerRemove(containerName)
+    
+    // 2. 启动构建容器
+    runBuildContainer(image, mnt, containerName, cmd)
+    
+    // 3. 等待容器执行完成
+    defer global.Docker.ContainerRemove(containerName)
+    waitForContainerComplete(containerName)
+}
+```
+### 6.2 容器运行配置
+```go
+func runBuildContainer(image, mnt, containerName, cmd string) error {
+    return global.Docker.Run(
+        &container.Config{
+            Image:      image,
+            WorkingDir: "/opt/mnt",
+            Cmd: strslice.StrSlice{"sh", "-c", cmd},
+        },
+        &container.HostConfig{
+            Mounts: []mount.Mount{
+                {
+                    Type:   mount.TypeBind,
+                    Source: mnt,          // 宿主机目录
+                    Target: "/opt/mnt",   // 容器内目录
+                },
+            },
+        }, nil, nil, containerName)
+}
+```
+## 7. 输出目录结构
+### 7.1 标准目录结构
+```
+rpm/
+├── CentOS/
+│   ├── 7/
+│   │   ├── amd64/
+│   │   │   ├── docker-ce/
+│   │   │   │   ├── docker-ce-20.10.7-3.el7.x86_64.rpm
+│   │   │   │   ├── docker-ce-cli-20.10.7-3.el7.x86_64.rpm
+│   │   │   │   └── ...
+│   │   │   └── repodata/
+│   │   │       ├── repomd.xml
+│   │   │       └── ...
+│   │   └── arm64/
+│   │       └── ...
+│   └── 8/
+│       ├── amd64/
+│       │   ├── docker-ce/
+│       │   ├── repodata/
+│       │   └── modules.yaml    # CentOS 8 特有
+│       └── arm64/
+│           └── ...
+├── Ubuntu/
+│   └── 22/
+│       ├── amd64/
+│       │   ├── docker-ce/
+│       │   │   ├── containerd.io_1.4.11-1_amd64.deb
+│       │   │   └── ...
+│       │   ├── Packages.gz     # APT 仓库索引
+│       │   └── archives/
+│       │       └── Packages.gz
+│       └── arm64/
+│           └── ...
+├── Kylin/
+│   └── V10/
+│       ├── amd64/
+│       │   ├── docker-ce/
+│       │   └── repodata/
+│       └── arm64/
+│           └── ...
+└── files/                      # 其他文件
+```
+### 7.2 无参数时输出
+```bash
+$ bke build rpm
+
+rpm
+├── CentOS
+│   ├── 7
+│   │   ├── amd64
+│   │   └── arm64
+│   └── 8
+│       ├── amd64
+│       └── arm64
+├── files
+├── Kylin
+│   └── V10
+│       ├── amd64
+│       └── arm64
+└── Ubuntu
+    └── 22
+        ├── amd64
+        └── arm64
+```
+## 8. 构建镜像说明
+| 镜像 | 用途 | 包含工具 |
+|------|------|----------|
+| `centos:7-amd64-build` | CentOS 7 / Kylin V10 | createrepo |
+| `centos:8-amd64-build` | CentOS 8 | createrepo, repo2module, modifyrepo_c |
+| `ubuntu:22-amd64-build` | Ubuntu 22 | dpkg-scanpackages, gzip |
+## 9. 使用示例
+### 9.1 初始化新仓库
+```bash
+# 创建目录结构
+mkdir -p rpm/CentOS/8/amd64/docker-ce
+
+# 放入 RPM 包
+cp *.rpm rpm/CentOS/8/amd64/docker-ce/
+
+# 构建仓库
+bke build rpm --source rpm
+```
+### 9.2 添加新包到已有仓库
+```bash
+# 准备新包目录
+mkdir -p new-packages/docker-ce
+cp docker-ce-*.rpm new-packages/docker-ce/
+
+# 添加到已有 rpm.tar.gz
+bke build rpm --source rpm.tar.gz --add centos/8/amd64 --package new-packages/docker-ce
+```
+### 9.3 仅构建指定系统
+```bash
+# 仅构建 Ubuntu 22 的 DEB 仓库
+mkdir -p debs/docker-ce
+cp *.deb debs/docker-ce/
+
+bke build rpm --add ubuntu/22/amd64 --package debs/docker-ce
+```
+### 9.4 自定义镜像仓库
+```bash
+bke build rpm --source rpm --registry cr.openfuyao.cn/openfuyao
+```
+## 10. 架构图
+```
+┌───────────────────────────────────────────────────────────────────────────┐
+│                         bke build rpm 架构                                │
+├───────────────────────────────────────────────────────────────────────────┤
+│                                                                           │
+│  ┌────────────────────────────────────────────────────────────────────┐   │
+│  │                        参数解析与校验                              │   │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐              │   │
+│  │  │ 验证 add     │  │ 验证 package │  │ 检查 Docker  │              │   │
+│  │  └──────────────┘  └──────────────┘  └──────────────┘              │   │
+│  └────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                      │
+│                ┌───────────────────┼───────────────────┐                  │
+│                ▼                   ▼                   ▼                  │
+│  ┌─────────────────────┐ ┌─────────────────────┐ ┌─────────────────────┐  │
+│  │   场景 1: 新建      │ │   场景 2: 全量构建  │ │   场景 3: 增量添加  │  │
+│  │   --add + --package │ │   --source          │ │   --source + --add  │  │
+│  │                     │ │                     │ │   + --package       │  │
+│  │  ┌───────────────┐  │ │  ┌───────────────┐  │ │  ┌───────────────┐  │  │
+│  │  │ rmpBuild()    │  │ │  │ prepareWork   │  │ │  │ 解压 tar.gz   │  │  │
+│  │  │ 构建单个系统  │  │ │  │ space()       │  │ │  └───────────────┘  │  │
+│  │  └───────────────┘  │ │  └───────────────┘  │ │  ┌───────────────┐  │  │
+│  │                     │ │  ┌───────────────┐  │ │  │ 复制新包      │  │  │
+│  │                     │ │  │ CopyDir()     │  │ │  └───────────────┘  │  │
+│  │                     │ │  └───────────────┘  │ │  ┌───────────────┐  │  │
+│  │                     │ │  ┌───────────────┐  │ │  │ rmpBuild()    │  │  │
+│  │                     │ │  │ 构建所有系统   │  │   └───────────────┘  │  │
+│  │                     │ │  └───────────────┘  │ │                     │  │
+│  └─────────────────────┘ └─────────────────────┘ └─────────────────────┘  │
+│                │                   │                   │                  │
+│                └───────────────────┼───────────────────┘                  │
+│                                    ▼                                      │
+│  ┌────────────────────────────────────────────────────────────────────┐   │
+│  │                        Docker 容器构建                             │   │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐              │   │
+│  │  │ CentOS 7     │  │ CentOS 8     │  │ Ubuntu 22    │              │   │
+│  │  │ createrepo   │  │ createrepo + │  │ dpkg-scan    │              │   │
+│  │  │              │  │ repo2module  │  │ packages     │              │   │
+│  │  └──────────────┘  └──────────────┘  └──────────────┘              │   │
+│  │  ┌──────────────┐                                                  │   │
+│  │  │ Kylin V10    │                                                  │   │
+│  │  │ createrepo   │                                                  │   │
+│  │  └──────────────┘                                                  │   │
+│  └────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│                                    ▼                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                           输出产物                                   │   │
+│  │                                                                       │   │
+│  │   rpm.tar.gz.1 (或直接生成 repodata/Packages.gz)                     │   │
+│  │                                                                       │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+## 11. 与 `bke build` 的关系
+`bke build rpm` 生成的 `rpm.tar.gz` 会被 `bke build` 命令使用：
+```yaml
+# bke.yaml 配置文件
+files:
+  - address: https://openfuyao.obs.cn-north-4.myhuaweicloud.com/rpm/releases/download/v0.0.1/
+    files:
+      - rpm.tar.gz    # 这里的 rpm.tar.gz 就是由 bke build rpm 生成的
+```
+在 `bke build` 执行过程中：
+```go
+func buildRpms(cfg *BuildConfig, stopChan <-chan struct{}) error {
+    // ...
+    // 解压 rpm.tar.gz
+    if err = buildFileRpm(); err != nil {
+        return err
+    }
+    // 同步 RPM 包到目标目录
+    for _, rpm := range cfg.Rpms {
+        syncPackage(url, rpm.System, rpm.SystemVersion, ...)
+    }
+    // ...
+}
+```
+
+
