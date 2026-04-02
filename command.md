@@ -6417,3 +6417,2847 @@ bke registry delete 192.168.2.111:40443/library/busybox:1.35
 ### 八、总结
 `bke registry` 是一个功能完善的容器镜像仓库管理工具，提供了镜像同步、迁移、检查、删除等完整功能。其核心设计思想是通过 `containers/image` 库实现高效的镜像操作，支持多架构镜像管理，并提供多种传输方式以适应不同场景。该工具是 BKE 集群镜像管理的重要组成部分，为离线环境和在线环境的镜像同步提供了可靠的解决方案。
 
+# `bke status` 命令的设计思路
+## 一、命令定位与设计理念
+### 1.1 命令定位
+`bke status` 命令的设计定位是：**快速查看 BKE 引导节点上所有基础服务的运行状态**。
+### 1.2 设计理念
+```
+┌─────────────────────────────────────────────────────────────┐
+│                   bke status 设计理念                         │
+└─────────────────────────────────────────────────────────────┘
+
+1. 一站式状态查看
+   └─> 一次命令查看所有服务状态，无需逐个检查
+   
+2. 运行时透明
+   └─> 自动识别容器运行时，适配不同的状态查询方式
+   
+3. 简洁直观
+   └─> 表格化输出，关键信息一目了然
+   
+4. 轻量级设计
+   └─> 只做状态查询，不涉及复杂的业务逻辑
+```
+## 二、服务状态模型设计
+### 2.1 服务分类
+```
+BKE 基础服务
+├── 容器服务
+│   ├── kubernetes               # K3s 本地 Kubernetes 集群
+│   ├── bocloud_image_registry   # 镜像仓库
+│   ├── bocloud_yum_registry     # YUM 包仓库
+│   ├── bocloud_chart_registry   # Helm Chart 仓库
+│   └── bocloud_nfs_registry     # NFS 共享存储
+└── 进程服务
+    └── ntpserver         # NTP 时间同步服务
+```
+### 2.2 服务状态数据结构
+每个服务的状态信息包含以下字段：
+```go
+// 服务状态信息结构
+// [服务类型, 服务名称, 默认监听地址, 运行状态, 数据挂载路径]
+type ServiceStatus [5]string
+
+// 示例：
+// ["docker", "bocloud_image_registry", "tcp://0.0.0.0:40443", "running", "/bke/mount/image_registry"]
+```
+**字段说明**：
+
+| 字段 | 说明 | 示例值 |
+|------|------|--------|
+| server | 服务运行方式 | docker / containerd / systemd / proc |
+| name | 服务名称 | bocloud_image_registry |
+| default | 默认监听地址 | tcp://0.0.0.0:40443 |
+| status | 运行状态 | running / notCreated / exited |
+| mount | 数据挂载路径 | /bke/mount/image_registry |
+## 三、状态检测机制设计
+### 3.1 容器服务状态检测
+#### Docker 运行时检测
+```go
+func getDockerContainerStatus(containerServers [][]string) [][]string {
+    var rows [][]string
+    for _, server := range containerServers {
+        newServer := server
+        // 通过 Docker API 检查容器是否存在
+        if info, ok := global.Docker.ContainerExists(server[1]); ok {
+            newServer[0] = "docker"              // 标记为 Docker 运行时
+            newServer[3] = info.State.Status     // 获取容器状态
+        }
+        rows = append(rows, newServer)
+    }
+    return rows
+}
+
+// Docker ContainerExists 实现
+func (c *Client) ContainerExists(containerName string) (types.ContainerJSON, bool) {
+    containerInfo, _ := c.Client.ContainerInspect(c.ctx, containerName)
+    // 检查容器是否存在
+    if containerInfo.ContainerJSONBase != nil {
+        return containerInfo, true
+    }
+    return types.ContainerJSON{}, false
+}
+```
+**关键点**：
+- 使用 Docker API 的 `ContainerInspect` 方法
+- 检查 `ContainerJSONBase` 是否为 nil 判断容器是否存在
+- 直接获取容器的 `State.Status` 字段
+#### Containerd 运行时检测
+```go
+func getContainerdContainerStatus(containerServers [][]string) [][]string {
+    var rows [][]string
+    for _, server := range containerServers {
+        newServer := server
+        newServer[0] = "containerd"
+        newServer[3] = "notCreated"
+        // 通过 nerdctl 检查容器是否存在
+        if info, err := econd.ContainerInspect(server[1]); err == nil && len(info.Id) > 0 {
+            newServer[3] = info.State.Status
+        }
+        rows = append(rows, newServer)
+    }
+    return rows
+}
+
+// Containerd ContainerInspect 实现
+func ContainerInspect(containerId string) (NerdContainerInfo, error) {
+    var info []NerdContainerInfo
+    // 使用 nerdctl inspect 命令
+    result, err := cmd.ExecuteCommandWithOutput(utils.NerdCtl, "inspect", containerId)
+    if err != nil {
+        return NerdContainerInfo{}, err
+    }
+    
+    err = json.Unmarshal([]byte(result), &info)
+    if err != nil {
+        return NerdContainerInfo{}, err
+    }
+    
+    if len(info) == 1 {
+        return info[0], nil
+    }
+    return NerdContainerInfo{}, errors.New("not found")
+}
+```
+**关键点**：
+- 使用 `nerdctl inspect` 命令获取容器信息
+- 通过检查 `info.Id` 长度判断容器是否存在
+- 解析 JSON 输出获取容器状态
+### 3.2 进程服务状态检测
+#### NTP 服务检测
+```go
+func getNtpServerStatus() []string {
+    server := []string{"proc", "ntpserver", fmt.Sprintf("udp://0.0.0.0:%d", utils.DefaultNTPServerPort), "notCreated", ""}
+    
+    // 方法1：尝试连接 NTP 服务
+    _, err := sntp.Client(fmt.Sprintf("127.0.0.1:%d", utils.DefaultNTPServerPort))
+    if err == nil {
+        server[3] = "running"
+    }
+    
+    // 方法2：检查 systemd 服务文件
+    if utils.Exists("/etc/systemd/system/ntpserver.service") {
+        server[0] = "systemd"
+    }
+    
+    return server
+}
+```
+**检测策略**：
+1. **主动探测**：尝试连接 NTP 服务端口，验证服务是否响应
+2. **文件检查**：检查 systemd 服务文件是否存在，判断服务管理方式
+## 四、运行时适配设计
+### 4.1 运行时检测逻辑
+```go
+func display() {
+    headers := []string{"server", "name", "default", "status", "mount"}
+    var rows [][]string
+    containerServers := getContainerServers()
+
+    // 根据运行时类型选择不同的检测方式
+    if infrastructure.IsDocker() {
+        rows = append(rows, getDockerContainerStatus(containerServers)...)
+    }
+
+    if infrastructure.IsContainerd() {
+        rows = append(rows, getContainerdContainerStatus(containerServers)...)
+    }
+
+    // NTP 服务独立检测
+    rows = append(rows, getNtpServerStatus())
+    
+    printStatusTable(headers, rows)
+}
+```
+### 4.2 运行时判断机制
+```go
+// 判断是否安装 Docker
+func IsDocker() bool {
+    if global.Docker == nil {
+        global.Docker, _ = docker.NewDockerClient()
+    }
+    if global.Docker != nil {
+        ctx, cancel := context.WithTimeout(context.Background(), utils.DefaultTimeoutSeconds*time.Second)
+        defer cancel()
+        _, err := global.Docker.GetClient().Ping(ctx)
+        if err == nil {
+            return true
+        }
+    }
+    return false
+}
+
+// 判断是否安装 Containerd
+func IsContainerd() bool {
+    if global.Containerd == nil {
+        global.Containerd, _ = containerd.NewContainedClient()
+    }
+    if global.Containerd != nil {
+        ctx, cancel := context.WithTimeout(context.Background(), utils.DefaultTimeoutSeconds*time.Second)
+        defer cancel()
+        flag, err := global.Containerd.GetClient().IsServing(ctx)
+        if flag && err == nil {
+            // 检查 nerdctl 工具是否存在
+            if !utils.Exists(utils.NerdCtl) {
+                return false
+            }
+            return true
+        }
+    }
+    return false
+}
+```
+**设计要点**：
+- 使用超时机制避免长时间阻塞
+- Docker 通过 `Ping` 方法验证连接
+- Containerd 通过 `IsServing` 方法验证服务状态
+- Containerd 额外检查 `nerdctl` 工具是否可用
+## 五、输出格式设计
+### 5.1 表格化输出
+```go
+func printStatusTable(headers []string, rows [][]string) {
+    const tabPadding = 2
+    w := tabwriter.NewWriter(os.Stdout, 0, 0, tabPadding, ' ', 0)
+    
+    // 打印表头
+    fmt.Fprintln(w, strings.Join(headers, "\t"))
+    
+    // 打印数据行
+    for _, row := range rows {
+        fmt.Fprintln(w, strings.Join(row, "\t"))
+    }
+    
+    if err := w.Flush(); err != nil {
+        fmt.Println("flush tablewriter failed:", err.Error())
+    }
+}
+```
+### 5.2 输出示例
+```bash
+$ bke status
+
+server      name                        default                  status      mount
+docker      kubernetes                  tcp://0.0.0.0:36443      running     
+docker      bocloud_image_registry      tcp://0.0.0.0:40443      running     /bke/mount/image_registry
+docker      bocloud_yum_registry        tcp://0.0.0.0:8080       running     /bke/mount/source_registry
+docker      bocloud_chart_registry      tcp://0.0.0.0:38080      running     /bke/mount/charts
+docker      bocloud_nfs_registry        tcp://0.0.0.0:2049       running     /bke/mount/nfsshare
+systemd     ntpserver                   udp://0.0.0.0:123        running     
+```
+**输出特点**：
+- 使用 `tabwriter` 自动对齐列
+- 清晰展示服务类型、名称、监听地址、状态和数据路径
+- 一目了然地展示所有服务的运行状态
+## 六、服务配置初始化
+### 6.1 容器服务配置
+```go
+func getContainerServers() [][]string {
+    return [][]string{
+        // [类型, 名称, 监听地址, 默认状态, 数据路径]
+        {
+            "container",
+            utils.LocalKubernetesName,  // "kubernetes"
+            fmt.Sprintf("tcp://0.0.0.0:%s", utils.DefaultKubernetesPort),  // "36443"
+            "notCreated",
+            "",
+        },
+        {
+            "container",
+            utils.LocalImageRegistryName,  // "bocloud_image_registry"
+            fmt.Sprintf("tcp://0.0.0.0:%s", configinit.DefaultImageRepoPort),  // "40443"
+            "notCreated",
+            fmt.Sprintf("%s/%s", global.Workspace, utils.ImageDataDirectory),  // "/bke/mount/image_registry"
+        },
+        {
+            "container",
+            utils.LocalYumRegistryName,  // "bocloud_yum_registry"
+            fmt.Sprintf("tcp://0.0.0.0:%s", configinit.DefaultYumRepoPort),  // "8080"
+            "notCreated",
+            fmt.Sprintf("%s/%s", global.Workspace, utils.SourceDataDirectory),  // "/bke/mount/source_registry"
+        },
+        {
+            "container",
+            utils.LocalChartRegistryName,  // "bocloud_chart_registry"
+            fmt.Sprintf("tcp://0.0.0.0:%s", utils.DefaultChartRegistryPort),  // "38080"
+            "notCreated",
+            fmt.Sprintf("%s/%s", global.Workspace, utils.ChartDataDirectory),  // "/bke/mount/charts"
+        },
+        {
+            "container",
+            utils.LocalNFSRegistryName,  // "bocloud_nfs_registry"
+            fmt.Sprintf("tcp://0.0.0.0:2049"),
+            "notCreated",
+            fmt.Sprintf("%s/%s", global.Workspace, utils.NFSDataDirectory),  // "/bke/mount/nfsshare"
+        },
+    }
+}
+```
+**设计要点**：
+- 统一的服务配置格式
+- 使用常量定义服务名称和端口，便于维护
+- 默认状态为 `notCreated`，后续通过检测更新
+## 七、设计优势
+### 7.1 架构优势
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    设计优势分析                               │
+└─────────────────────────────────────────────────────────────┘
+1. 关注点分离
+   ├─> 状态检测逻辑与显示逻辑分离
+   ├─> 不同运行时的检测逻辑独立实现
+   └─> 易于扩展新的服务类型
+
+2. 运行时透明
+   ├─> 自动识别 Docker 或 Containerd
+   ├─> 用户无需关心底层运行时差异
+   └─> 统一的状态展示格式
+
+3. 性能优化
+   ├─> 使用超时机制避免阻塞
+   ├─> 并发检测（未来可扩展）
+   └─> 轻量级查询，快速响应
+
+4. 可维护性
+   ├─> 清晰的代码结构
+   ├─> 完善的单元测试
+   └─> 易于调试和排查问题
+```
+### 7.2 用户体验优势
+| 优势 | 说明 |
+|------|------|
+| 一键查看 | 无需逐个服务检查，一次命令获取所有状态 |
+| 信息完整 | 包含服务类型、名称、端口、状态、数据路径 |
+| 格式清晰 | 表格化输出，自动对齐，易于阅读 |
+| 快速响应 | 轻量级查询，秒级返回结果 |
+## 八、与其他命令的关系
+### 8.1 命令协作关系
+```
+bke init
+├─> 启动所有服务
+└─> 可使用 bke status 验证服务状态
+
+bke start <service>
+├─> 启动指定服务
+└─> 可使用 bke status 验证服务状态
+
+bke reset
+├─> 停止并清理所有服务
+└─> 可使用 bke status 确认服务已停止
+
+bke status
+└─> 独立使用，随时查看服务状态
+```
+### 8.2 使用场景
+| 场景 | 使用方式 |
+|------|----------|
+| 初始化后验证 | `bke init` 后执行 `bke status` 确认服务正常 |
+| 服务启动检查 | `bke start image` 后执行 `bke status` 查看状态 |
+| 问题排查 | 服务异常时执行 `bke status` 快速定位问题 |
+| 日常运维 | 定期执行 `bke status` 监控服务健康状态 |
+## 九、扩展性设计
+### 9.1 添加新服务
+```go
+// 步骤1：在 getContainerServers() 中添加服务配置
+func getContainerServers() [][]string {
+    return [][]string{
+        // ... 现有服务 ...
+        {
+            "container",
+            "new_service",  // 新服务名称
+            "tcp://0.0.0.0:8080",  // 监听地址
+            "notCreated",
+            "/data/new_service",  // 数据路径
+        },
+    }
+}
+
+// 步骤2：如果需要特殊检测逻辑，添加对应的检测函数
+func getNewServiceStatus() []string {
+    // 实现特定的状态检测逻辑
+}
+```
+### 9.2 支持新的运行时
+```go
+// 添加新的运行时检测函数
+func getPodmanContainerStatus(containerServers [][]string) [][]string {
+    var rows [][]string
+    for _, server := range containerServers {
+        newServer := server
+        newServer[0] = "podman"
+        // 实现 Podman 的容器状态检测逻辑
+        // ...
+        rows = append(rows, newServer)
+    }
+    return rows
+}
+
+// 在 display() 中添加运行时判断
+func display() {
+    // ... 现有逻辑 ...
+    
+    if infrastructure.IsPodman() {
+        rows = append(rows, getPodmanContainerStatus(containerServers)...)
+    }
+    
+    // ...
+}
+```
+## 十、总结
+`bke status` 命令的设计思路体现了以下核心思想：
+1. **用户至上**：提供一站式状态查看，简化用户操作
+2. **运行时无关**：自动适配不同的容器运行时，对用户透明
+3. **简洁高效**：轻量级查询，快速响应，表格化输出清晰直观
+4. **易于扩展**：模块化设计，便于添加新服务和新运行时
+5. **健壮可靠**：使用超时机制和错误处理，确保命令稳定运行
+
+这个命令是 BKE 运维体系中的重要组成部分，为用户提供了快速、直观的服务状态监控能力。
+
+# `bke start` 命令的设计思路
+## 一、命令定位与设计理念
+### 1.1 命令定位
+`bke start` 命令的设计定位是：**独立启动 BKE 集群所需的基础依赖服务**。
+### 1.2 设计理念
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    bke start 设计理念                         │
+└─────────────────────────────────────────────────────────────┘
+
+1. 模块化设计
+   └─> 每个服务独立管理，可单独启动/停止
+   
+2. 运行时无关性
+   └─> 支持 Docker 和 Containerd 两种容器运行时
+   
+3. 配置灵活性
+   └─> 提供默认配置，同时支持用户自定义
+   
+4. 幂等性保证
+   └─> 服务已运行时不会重复启动
+   
+5. 独立可用性
+   └─> 可脱离 bke init 独立使用，便于调试和维护
+```
+## 二、命令结构设计
+### 2.1 命令树结构
+```
+bke start
+├── bke start image        # 启动镜像仓库服务
+├── bke start yum          # 启动 YUM 包仓库服务
+├── bke start nfs          # 启动 NFS 共享存储服务
+├── bke start chart        # 启动 Helm Chart 仓库服务
+└── bke start ntpserver    # 启动 NTP 时间同步服务
+```
+### 2.2 命令参数设计
+每个子命令都支持以下参数（NTP 除外）：
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--name` | 容器名称 | 服务特定默认值 |
+| `--image` | 镜像地址 | 服务特定默认值 |
+| `--port` | 服务端口 | 服务特定默认值 |
+| `--data` | 数据目录 | `/tmp/<service>` |
+
+**NTP 服务特殊参数**：
+
+| 参数 | 说明 |
+|------|------|
+| `--systemd` | 使用 systemd 管理服务 |
+| `--foreground` | 前台运行服务 |
+## 三、核心服务设计
+### 3.1 镜像仓库服务
+**功能**：提供 Docker 镜像的存储和分发能力
+
+**设计要点**：
+```go
+// 1. 运行时适配
+func StartImageRegistry(name, image, imageRegistryPort, imageDataDirectory string) error {
+    if infrastructure.IsContainerd() && !infrastructure.IsDocker() {
+        return startImageRegistryWithContainerd(name, image, imageRegistryPort, imageDataDirectory)
+    }
+    
+    if !infrastructure.IsDocker() {
+        log.BKEFormat(log.ERROR, "docker or containerd runtime not found.")
+        return nil
+    }
+    return startImageRegistryWithDocker(name, image, imageRegistryPort, imageDataDirectory)
+}
+
+// 2. Docker 实现
+func startImageRegistryWithDocker(name, image, imageRegistryPort, imageDataDirectory string) error {
+    // 生成证书配置
+    certPath := fmt.Sprintf("/etc/docker/%s", name)
+    if err := generateConfig(certPath, imageRegistryPort); err != nil {
+        return err
+    }
+    
+    // 确保镜像存在
+    if err := global.Docker.EnsureImageExists(...); err != nil {
+        return err
+    }
+    
+    // 检查容器是否已运行
+    serverRunFlag, err := global.Docker.EnsureContainerRun(name)
+    if serverRunFlag {
+        log.BKEFormat(log.INFO, "The mirror warehouse service is already running.")
+        return nil
+    }
+    
+    // 启动容器
+    return runDockerImageRegistry(name, image, imageRegistryPort, imageDataDirectory, certPath)
+}
+```
+**关键特性**：
+- 支持 HTTPS（自动生成证书）
+- 数据持久化（通过 volume 挂载）
+- 自动重启策略
+- 容器 IP 分配（Containerd 模式）
+### 3.2 YUM 包仓库服务
+**功能**：提供 RPM/DEB 软件包的存储和分发
+
+**设计要点**：
+```go
+// 使用 Nginx 作为 HTTP 服务器
+func runDockerYumRegistry(name, image, yumRegistryPort, yumDataDirectory string) error {
+    return global.Docker.Run(
+        &container.Config{
+            Image:        image,
+            ExposedPorts: map[nat.Port]struct{}{"80/tcp": {}},
+        },
+        &container.HostConfig{
+            Mounts: []mount.Mount{
+                {Type: mount.TypeBind, Source: yumDataDirectory, Target: "/repo"},
+            },
+            PortBindings: map[nat.Port][]nat.PortBinding{
+                nat.Port("80/tcp"): {{HostIP: "0.0.0.0", HostPort: yumRegistryPort}},
+            },
+            RestartPolicy: container.RestartPolicy{Name: "always"},
+        },
+        nil, nil, name,
+    )
+}
+```
+**关键特性**：
+- 使用 Nginx 提供静态文件服务
+- 支持自定义配置文件
+- 数据目录挂载到 `/repo`
+### 3.3 NFS 共享存储服务
+**功能**：提供 NFS 共享存储能力
+
+**设计要点**：
+```go
+func runDockerNFSServer(name, image, nfsDataDirectory string) error {
+    return global.Docker.Run(
+        &container.Config{
+            Image: image,
+            Env: []string{
+                "SHARED_DIRECTORY=/nfsshare",
+                "FILEPERMISSIONS_UID=0",
+                "FILEPERMISSIONS_GID=0",
+                "FILEPERMISSIONS_MODE=0755",
+            },
+        },
+        &container.HostHostConfig{
+            Mounts:     []mount.Mount{{Type: mount.TypeBind, Source: nfsDataDirectory, Target: "/nfsshare"}},
+            Privileged: true,  // NFS 需要特权模式
+            CapAdd:    strslice.StrSlice{"SYS_ADMIN", "SETPCAP"},
+        },
+        nil, nil, name,
+    )
+}
+```
+**关键特性**：
+- 需要特权模式运行
+- 自动设置文件权限
+- 支持多客户端并发访问
+### 3.4 Helm Chart 仓库服务
+**功能**：提供 Helm Chart 的存储和分发
+
+**设计要点**：
+```go
+func runDockerChartRegistry(name, image, chartRegistryPort, chartDataDirectory string) error {
+    return global.Docker.Run(
+        &container.Config{
+            Image: image,
+            Env: []string{
+                "DEBUG=true",
+                "STORAGE=local",
+                "STORAGE_LOCAL_ROOTDIR=/charts",
+            },
+        },
+        &container.HostConfig{
+            Mounts: []mount.Mount{
+                {Type: mount.TypeBind, Source: chartDataDirectory, Target: "/charts"},
+            },
+            PortBindings: map[nat.Port][]nat.PortBinding{
+                nat.Port("8080/tcp"): {{HostIP: "0.0.0.0", HostPort: chartRegistryPort}},
+            },
+        },
+        nil, nil, name,
+    )
+}
+```
+**关键特性**：
+- 使用 ChartMuseum 作为后端
+- 支持本地存储模式
+- 提供 API 接口
+### 3.5 NTP 时间同步服务
+**功能**：提供网络时间同步服务
+
+**设计要点**：
+```go
+// 支持三种运行模式
+func (op *Options) ntpServerStartCmd() {
+    // 1. 检查服务是否已运行
+    _, err := sntp.Client(fmt.Sprintf("127.0.0.1:%d", utils.DefaultNTPServerPort))
+    if err == nil {
+        log.BKEFormat(log.INFO, "The ntp server is running")
+        return
+    }
+    
+    // 2. systemd 模式（推荐用于生产环境）
+    if cmd.Flag("systemd").Value.String() == "true" {
+        server.SystemdNTPServer()
+        return
+    }
+    
+    // 3. 前台模式（用于调试）
+    if cmd.Flag("foreground").Value.String() == "true" {
+        server.SystemdDaemonNTPServer()
+        return
+    }
+    
+    // 4. 守护进程模式（默认）
+    server.DaemonNTPServer()
+}
+```
+**关键特性**：
+- 支持多种运行模式
+- 自动生成 systemd 服务文件
+- 支持进程守护
+## 四、运行时适配设计
+### 4.1 运行时检测
+```go
+// 在 infrastructure 包中实现运行时检测
+func IsDocker() bool {
+    // 检查 Docker 是否可用
+}
+
+func IsContainerd() bool {
+    // 检查 Containerd 是否可用
+}
+```
+### 4.2 统一接口设计
+```go
+// 每个服务都提供统一的启动接口
+func StartXxxService(name, image, port, data string) error {
+    if infrastructure.IsContainerd() && !infrastructure.IsDocker() {
+        return startXxxWithContainerd(...)
+    }
+    
+    if !infrastructure.IsDocker() {
+        return fmt.Errorf("no supported container runtime found")
+    }
+    
+    return startXxxWithDocker(...)
+}
+```
+### 4.3 运行时差异处理
+| 特性 | Docker | Containerd |
+|------|--------|------------|
+| 容器运行 | `docker run` | `nerdctl run` |
+| 镜像管理 | Docker API | nerdctl CLI |
+| 网络配置 | 自动分配 | 手动分配 IP |
+| 证书路径 | `/etc/docker/<name>` | `<k3s-data-dir>/<name>` |
+## 五、与 bke init 的关系
+### 5.1 调用关系
+```
+bke init
+└─> ensureRepository()
+    ├─> LoadLocalImage()           # 加载本地镜像
+    ├─> LoadLocalRepository()      # 加载本地仓库镜像
+    ├─> ContainerServer()          # 启动镜像仓库
+    │   └─> server.StartImageRegistry()
+    ├─> YumServer()                # 启动 YUM 仓库
+    │   └─> server.StartYumRegistry()
+    ├─> ChartServer()              # 启动 Chart 仓库
+    │   └─> server.StartChartRegistry()
+    └─> NFSServer()                # 启动 NFS 服务
+        └─> server.StartNFSServer()
+```
+### 5.2 使用场景对比
+| 场景 | bke init | bke start |
+|------|----------|-----------|
+| 初始化引导节点 | ✅ 使用 | ❌ 不适用 |
+| 单独启动某个服务 | ❌ 不适用 | ✅ 使用 |
+| 调试服务问题 | ❌ 不适用 | ✅ 使用 |
+| 服务重启 | ❌ 不适用 | ✅ 使用 |
+| 自定义配置 | ❌ 固定配置 | ✅ 灵活配置 |
+## 六、设计优势
+### 6.1 模块化
+```
+优势：
+1. 每个服务独立管理，职责清晰
+2. 便于单独调试和维护
+3. 支持按需启动服务
+```
+### 6.2 可扩展性
+```
+优势：
+1. 易于添加新的服务类型
+2. 支持自定义镜像和配置
+3. 适配多种容器运行时
+```
+### 6.3 用户友好
+```
+优势：
+1. 提供合理的默认值，开箱即用
+2. 支持自定义配置，满足特殊需求
+3. 清晰的错误提示和日志输出
+```
+### 6.4 健壮性
+```
+优势：
+1. 幂等性设计，避免重复启动
+2. 自动重试机制
+3. 服务健康检查
+```
+## 七、使用示例
+### 7.1 启动镜像仓库
+```bash
+# 使用默认配置
+bke start image
+
+# 自定义配置
+bke start image \
+  --name my-registry \
+  --image registry:2.8.1 \
+  --port 5000 \
+  --data /data/registry
+```
+### 7.2 启动 NTP 服务
+```bash
+# 守护进程模式（默认）
+bke start ntpserver
+# systemd 服务模式
+bke start ntpserver --systemd
+# 前台运行（调试用）
+bke start ntpserver --foreground
+```
+### 7.3 启动所有服务
+```bash
+# 依次启动各个服务
+bke start image
+bke start yum
+bke start chart
+bke start nfs
+bke start ntpserver
+```
+## 八、总结
+`bke start` 命令的设计思路体现了以下核心思想：
+1. **关注点分离**：将基础服务的启动逻辑从 `bke init` 中分离出来，提供独立的管理入口
+2. **运行时无关**：通过适配器模式支持多种容器运行时，提高兼容性
+3. **配置灵活**：提供默认配置的同时支持用户自定义，平衡易用性和灵活性
+4. **幂等性保证**：服务启动前检查状态，避免重复启动造成的问题
+5. **可观测性**：提供清晰的日志输出，便于问题排查
+
+这种设计使得 BKE 的基础服务管理更加灵活、可靠和易于维护。
+
+    
+# `bke reset` 命令的设计思路。
+## 一、命令定位与设计理念
+### 1.1 命令定位
+`bke reset` 命令的设计定位是：**清理引导节点上的 BKE 相关服务，恢复节点到指定状态**。
+### 1.2 设计理念
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    bke reset 设计理念                       │
+└─────────────────────────────────────────────────────────────┘
+
+1. 分级清理
+   └─> 提供多种清理级别，满足不同场景需求
+   
+2. 安全确认
+   └─> 危险操作前要求用户确认，防止误操作
+   
+3. 全面覆盖
+   └─> 清理所有相关组件，避免残留
+   
+4. 运行时无关
+   └─> 支持 Docker 和 Containerd 两种运行时
+   
+5. 幂等性
+   └─> 可重复执行，不会因已清理而失败
+```
+## 二、命令参数设计
+### 2.1 参数说明
+| 参数 | 说明 | 默认值 | 使用场景 |
+|------|------|--------|----------|
+| `--all` | 恢复节点到初始状态 | `false` | 完全清理，包括容器运行时 |
+| `--mount` | 删除解压目录和服务 | `false` | 清理数据目录 |
+| `--confirm` | 跳过删除确认 | `false` | 自动化脚本中使用 |
+### 2.2 清理级别
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    清理级别矩阵                             │
+└─────────────────────────────────────────────────────────────┘
+Level 1: bke reset（默认）
+├─> 删除本地 Kubernetes 集群（k3s）
+└─> 清理 /etc/rancher 和 /var/lib/rancher
+
+Level 2: bke reset --mount
+├─> Level 1 的所有操作
+├─> 删除 mount 数据目录
+├─> 删除容器服务（镜像仓库、YUM、Chart、NFS）
+└─> 删除 NTP 服务
+
+Level 3: bke reset --all
+├─> Level 1 的所有操作
+├─> 删除容器服务
+├─> 删除 NTP 服务
+├─> 清理 Kubelet（二进制和容器）
+├─> 清理 Kubernetes 容器
+├─> 清理其他容器
+├─> 清理容器运行时
+├─> 清理网络配置
+└─> 清理所有相关文件
+
+Level 4: bke reset --all --mount
+├─> Level 3 的所有操作
+└─> 删除 mount 数据目录
+```
+### 2.3 安全确认机制
+```go
+PreRunE: func(cmd *cobra.Command, args []string) error {
+    if resetOption.All && !confirm {
+        fmt.Println("This instruction deletes the container service and the container runtime, " +
+            "returning it to an uninitialized state")
+        if !utils.PromptForConfirmation(confirm) {
+            return fmt.Errorf("operation cancelled by user")
+        }
+    }
+    return nil
+}
+```
+**设计要点**：
+- `--all` 参数会删除容器运行时，属于危险操作
+- 必须显式确认或使用 `--confirm` 跳过确认
+- 防止用户误操作导致数据丢失
+## 三、核心清理流程设计
+### 3.1 主流程架构
+```go
+func (op *Options) Reset() {
+    // 1. 删除本地 Kubernetes 集群（必选）
+    RemoveLocalKubernetes()
+    
+    // 2. 完全清理模式
+    if op.All {
+        RemoveContainerService()      // 删除容器服务
+        RemoveNtpService()            // 删除 NTP 服务
+        removeAllInOne()              // 全面清理
+        source.ResetSource()          // 重置软件源
+        syscompat.RepoUpdate()        // 更新软件源
+    }
+    
+    // 3. 清理数据目录模式
+    if op.Mount {
+        RemoveDataDir()               // 删除数据目录
+        if !op.All {
+            RemoveContainerService()  // 删除容器服务
+            RemoveNtpService()        // 删除 NTP 服务
+            source.ResetSource()      // 重置软件源
+        }
+    }
+    
+    log.BKEFormat(log.INFO, "BKE reset completed")
+}
+```
+### 3.2 清理流程图
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    bke reset 流程图                           │
+└─────────────────────────────────────────────────────────────┘
+
+开始
+  │
+  ├─> RemoveLocalKubernetes()
+  │     ├─> 检测运行时类型（Docker/Containerd）
+  │     ├─> 删除 k3s 容器
+  │     └─> 删除 /etc/rancher 和 /var/lib/rancher
+  │
+  ├─> if op.All?
+  │     ├─> Yes ─> RemoveContainerService()
+  │     │           ├─> 删除镜像仓库
+  │     │           ├─> 删除 YUM 仓库
+  │     │           ├─> 删除 Chart 仓库
+  │     │           └─> 删除 NFS 服务
+  │     │
+  │     ├─> RemoveNtpService()
+  │     │     └─> 删除 NTP 服务（systemd/进程）
+  │     │
+  │     ├─> removeAllInOne()
+  │     │     ├─> cleanKubeletBin()           # 清理 Kubelet 二进制
+  │     │     ├─> cleanKubernetesContainer()   # 清理 K8s 容器
+  │     │     ├─> cleanOtherContainer()        # 清理其他容器
+  │     │     ├─> cleanContainerRuntime()      # 清理容器运行时
+  │     │     ├─> cleanNetwork()               # 清理网络配置
+  │     │     └─> cleanNeedDeleteFile()        # 清理文件
+  │     │
+  │     ├─> source.ResetSource()               # 重置软件源
+  │     └─> syscompat.RepoUpdate()             # 更新软件源
+  │
+  ├─> if op.Mount?
+  │     ├─> Yes ─> RemoveDataDir()
+  │     │             └─> 删除 <workspace>/mount 目录
+  │     │
+  │     └─> if !op.All?
+  │           ├─> RemoveContainerService()
+  │           ├─> RemoveNtpService()
+  │           └─> source.ResetSource()
+  │
+  └─> 完成
+```
+## 四、详细清理组件设计
+### 4.1 本地 Kubernetes 集群清理
+```go
+func RemoveLocalKubernetes() {
+    if infrastructure.IsDocker() {
+        log.BKEFormat(log.INFO, "Remove local Kubernetes")
+        _ = global.Docker.ContainerRemove(utils.LocalKubernetesName)
+        os.RemoveAll("/etc/rancher")
+        os.RemoveAll("/var/lib/rancher")
+        return
+    }
+    
+    if infrastructure.IsContainerd() {
+        log.BKEFormat(log.INFO, "Remove local Kubernetes")
+        _ = econd.ContainerRemove(utils.LocalKubernetesName)
+        os.RemoveAll("/etc/rancher")
+        os.RemoveAll("/var/lib/rancher")
+        return
+    }
+}
+```
+**清理内容**：
+- k3s 容器（名称为 `kubernetes`）
+- `/etc/rancher` 配置目录
+- `/var/lib/rancher` 数据目录
+### 4.2 容器服务清理
+```go
+func RemoveContainerService() {
+    _ = server.RemoveImageRegistry(utils.LocalImageRegistryName)  // 镜像仓库
+    _ = server.RemoveChartRegistry(utils.LocalChartRegistryName)  // Chart 仓库
+    _ = server.RemoveYumRegistry(utils.LocalYumRegistryName)      // YUM 仓库
+    _ = server.RemoveNFSServer(utils.LocalNFSRegistryName)        // NFS 服务
+}
+```
+**清理内容**：
+- 镜像仓库容器（registry:2.8.1）
+- YUM 仓库容器
+- Chart 仓库容器
+- NFS 服务容器
+### 4.3 Kubelet 清理
+```go
+func cleanKubeletBin() {
+    log.BKEFormat(log.INFO, "clean kubelet...")
+    
+    // 1. 停止 kubelet 服务
+    out, err := global.Command.ExecuteCommandWithCombinedOutput("/bin/sh", "-c", 
+        "systemctl stop kubelet && systemctl disable kubelet && rm -f /etc/systemd/system/kubelet.service")
+    
+    // 2. 删除 kubelet 二进制
+    out, err = global.Command.ExecuteCommandWithCombinedOutput("/bin/sh", "-c", 
+        "sudo rm -f $(which kubelet)")
+    
+    // 3. 强制删除（如果上述失败）
+    if err != nil {
+        out, err = global.Command.ExecuteCommandWithCombinedOutput("/bin/sh", "-c", 
+            "sudo rm -rf /var/lib/kubelet && sudo rm -rf /usr/bin/kubelet && " +
+            "sudo rm -rf /etc/systemd/system/kubelet.service")
+    }
+    
+    // 4. 添加需要删除的文件
+    needDeleteFile = append(needDeleteFile, []string{
+        "/etc/cni/net.d/10-calico.conflist",
+        "/etc/kubernetes",
+    }...)
+}
+```
+**清理策略**：
+1. 优雅停止：`systemctl stop kubelet`
+2. 正常删除：删除二进制文件
+3. 强制删除：直接删除目录和文件
+4. 清理配置：CNI 配置、Kubernetes 配置
+### 4.4 Kubernetes 容器清理
+```go
+func cleanKubernetesContainer() {
+    log.BKEFormat(log.INFO, "clean kubernetes container...")
+    
+    // 1. 清理 Docker 中的 K8s 容器
+    cleanDockerK8sContainers()
+    
+    // 2. 清理 Containerd 中的 K8s 容器
+    cleanContainerdK8sContainers()
+    
+    // 3. 卸载 kubelet 目录
+    unmountKubeletDirectories(rootDir)
+    
+    // 4. 添加需要删除的文件
+    needDeleteFile = append(needDeleteFile, rootDir)
+}
+```
+**Docker 清理流程**：
+```go
+func cleanDockerK8sContainers() bool {
+    // 1. 列出所有 K8s 容器（排除 kubelet）
+    out, err := global.Command.ExecuteCommandWithOutput("/bin/sh", "-c", 
+        "docker ps -a --filter name=k8s_ -q | grep -v kubelet")
+    
+    // 2. 逐个删除容器
+    pods := strings.Fields(out)
+    for _, pod := range pods {
+        // 2.1 尝试优雅停止
+        out, err = global.Command.ExecuteCommandWithOutput("/bin/sh", "-c", 
+            "docker stop " + pod)
+        
+        // 2.2 尝试正常删除
+        if err == nil {
+            out, err = global.Command.ExecuteCommandWithOutput("/bin/sh", "-c", 
+                "docker rm --volumes " + pod)
+        }
+        
+        // 2.3 强制删除
+        if err != nil {
+            out, err = global.Command.ExecuteCommandWithOutput("/bin/sh", "-c", 
+                "docker rm -f --volumes " + pod)
+        }
+    }
+    return true
+}
+```
+**Containerd 清理流程**：
+```go
+func cleanContainerdK8sContainers() {
+    // 1. 列出所有 Pod
+    out, err := global.Command.ExecuteCommandWithOutput("/bin/sh", "-c", 
+        "crictl pods -q")
+    
+    // 2. 逐个删除 Pod
+    pods := strings.Fields(out)
+    for _, pod := range pods {
+        // 2.1 尝试优雅停止
+        out, err = global.Command.ExecuteCommandWithOutput("/bin/sh", "-c", 
+            "crictl stopp " + pod)
+        
+        // 2.2 尝试正常删除
+        if err == nil {
+            out, err = global.Command.ExecuteCommandWithOutput("/bin/sh", "-c", 
+                "crictl rmp " + pod)
+        }
+        
+        // 2.3 强制删除
+        if err != nil {
+            out, err = global.Command.ExecuteCommandWithOutput("/bin/sh", "-c", 
+                "crictl rmp -f " + pod)
+        }
+    }
+}
+```
+### 4.5 其他容器清理
+```go
+func cleanOtherContainer() {
+    log.BKEFormat(log.INFO, "clean other container...")
+    
+    // 1. 清理所有 Docker 容器
+    cleanDockerAllContainers()
+    
+    // 2. 清理所有 Containerd 容器
+    cleanContainerdAllContainers()
+}
+
+func cleanDockerAllContainers() {
+    // 1. 列出所有容器
+    out, err := global.Command.ExecuteCommandWithCombinedOutput("/bin/sh", "-c", 
+        "docker ps -a -q")
+    
+    // 2. 强制删除所有容器
+    pods := strings.Fields(out)
+    for _, pod := range pods {
+        global.Command.ExecuteCommandWithOutput("/bin/sh", "-c", 
+            "docker rm -f --volumes " + pod)
+    }
+    
+    // 3. 清理 Docker 系统
+    global.Command.ExecuteCommandWithCombinedOutput("/bin/sh", "-c", 
+        "docker system prune -a -f --volumes")
+}
+
+func cleanContainerdAllContainers() {
+    // 1. 使用 crictl 清理
+    cleanCrictlContainers()
+    
+    // 2. 使用 nerdctl 清理
+    cleanNerdctlContainers()
+    
+    // 3. 清理 nerdctl 系统
+    global.Command.ExecuteCommandWithOutput("/bin/sh", "-c", 
+        "nerdctl --namespace k8s.io system prune -a -f --volumes && " +
+        "nerdctl system image prune -a -f")
+}
+```
+### 4.6 容器运行时清理
+```go
+func cleanContainerRuntime() {
+    log.BKEFormat(log.INFO, "clean container runtime...")
+    
+    // 1. 停止并禁用 Docker
+    if infrastructure.IsDocker() {
+        global.Command.ExecuteCommandWithCombinedOutput("/bin/sh", "-c", 
+            "systemctl stop docker")
+        global.Command.ExecuteCommandWithCombinedOutput("/bin/sh", "-c", 
+            "systemctl disable docker")
+    }
+    
+    // 2. 停止并禁用 Containerd
+    if infrastructure.IsContainerd() {
+        global.Command.ExecuteCommandWithCombinedOutput("/bin/sh", "-c", 
+            "systemctl stop containerd")
+        global.Command.ExecuteCommandWithCombinedOutput("/bin/sh", "-c", 
+            "systemctl disable containerd")
+    }
+    
+    // 3. 卸载 Docker 软件包
+    if needRemoveDocker {
+        repoRemove("docker*", "containerd.io")
+    }
+    
+    // 4. 添加需要删除的文件
+    addNeedDeleteFile()
+}
+
+func addNeedDeleteFile() {
+    // Docker 相关文件
+    needDeleteFile = append(needDeleteFile, []string{
+        "/var/lib/docker",           // Docker 数据目录
+        "/etc/docker",               // Docker 配置目录
+        "/var/lib/cni",              // CNI 数据目录
+        "/etc/cni",                  // CNI 配置目录
+        "/opt/cni",                  // CNI 二进制目录
+    }...)
+    
+    // Containerd 相关文件
+    needDeleteFile = append(needDeleteFile, []string{
+        "/usr/bin/containerd",
+        "/usr/bin/containerd-shim",
+        "/usr/bin/crictl",
+        "/usr/bin/ctr",
+        "/usr/bin/nerdctl",
+        "/etc/containerd",
+        "/var/lib/containerd",
+        "/var/lib/nerdctl",
+    }...)
+    
+    // Docker 二进制文件
+    needDeleteFile = append(needDeleteFile, []string{
+        "/usr/bin/docker",
+        "/usr/bin/dockerd",
+        "/usr/bin/docker-init",
+        "/usr/bin/docker-proxy",
+        "/usr/bin/runc",
+    }...)
+}
+```
+### 4.7 网络清理
+```go
+func cleanNetwork() {
+    log.BKEFormat(log.INFO, "clean network...")
+    
+    // 1. 清理 iptables 规则
+    cmd := "iptables -F -t raw && iptables -F -t filter && " +
+           "iptables -t nat -F && iptables -t mangle -F && " +
+           "iptables -X -t nat && iptables -X -t raw && " +
+           "iptables -X -t mangle && iptables -X -t filter"
+    global.Command.ExecuteCommandWithCombinedOutput("/bin/sh", "-c", cmd)
+    
+    // 2. 清理路由
+    cleanIpRoute()
+    
+    // 3. 清理邻居
+    cleanIpNeighbor()
+    
+    // 4. 清理虚拟网卡
+    cleanIpLink()
+    
+    // 5. 删除网桥
+    global.Command.ExecuteCommandWithOutput("/bin/sh", "-c", "ip link del nerdctl0")
+    global.Command.ExecuteCommandWithOutput("/bin/sh", "-c", "ip link del docker0")
+}
+```
+**网络清理细节**：
+```go
+// 清理路由（boc0 和 cali 相关）
+func cleanIpRoute() {
+    cmd := `ip route show all | awk '($1 != "default" && $3 ~ /^(boc0|cali.*)$/) 
+            {printf "%s %s %s\n", $1, $2, $3}'`
+    output, _ := global.Command.ExecuteCommandWithCombinedOutput("/bin/sh", "-c", cmd)
+    
+    routes := strings.Split(output, "\n")
+    for _, route := range routes {
+        if route != "" {
+            global.Command.ExecuteCommandWithCombinedOutput("/bin/sh", "-c", 
+                "ip route del " + route)
+        }
+    }
+}
+
+// 清理虚拟网卡（Calico 和 Fabric）
+func cleanIpLink() {
+    needRemoveInters := []string{
+        "vxlan_sys_4789",    // Fabric VXLAN
+        "gre_sys",           // Fabric GRE
+        "genev_sys_6081",    // Fabric Geneve
+        "erspan_sys",        // Fabric ERSPAN
+        "vxlan.calico",      // Calico VXLAN
+    }
+    
+    // 获取所有网卡
+    cmd := `ip link | awk '/state/ {gsub(/:/, ""); print $2}'`
+    output, _ := global.Command.ExecuteCommandWithCombinedOutput("/bin/sh", "-c", cmd)
+    
+    inters := strings.Split(output, "\n")
+    for _, inter := range inters {
+        if utils.ContainsString(needRemoveInters, inter) {
+            // 关闭网卡
+            global.Command.ExecuteCommandWithCombinedOutput("/bin/sh", "-c", 
+                "ip link set " + inter + " down")
+            // 删除网卡
+            global.Command.ExecuteCommandWithCombinedOutput("/bin/sh", "-c", 
+                "ip link del " + inter)
+        }
+    }
+}
+```
+### 4.8 文件清理
+```go
+func cleanNeedDeleteFile() {
+    log.BKEFormat(log.INFO, "clean file...")
+    
+    // 添加需要删除的文件
+    needDeleteFile = append(needDeleteFile, []string{
+        "/etc/openFuyao/haproxy",
+        "/etc/openFuyao/keepalived",
+        "/usr/bin/calicoctl",
+        "/etc/calico",
+        "/usr/bin/kubectl",
+        "/etc/openFuyao/addons",
+        "/etc/openFuyao/bkeagent",
+        "/usr/local/bin/bkeagent",
+        // ... 更多文件
+    }...)
+    
+    // 执行删除
+    for _, file := range needDeleteFile {
+        if err := os.RemoveAll(file); err != nil {
+            log.BKEFormat(log.WARN, fmt.Sprintf("Failed to remove %s: %v", file, err))
+        }
+    }
+}
+```
+## 五、清理策略设计
+### 5.1 三级清理策略
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    清理策略矩阵                               │
+└─────────────────────────────────────────────────────────────┘
+
+Level 1: 优雅清理
+├─> systemctl stop <service>
+├─> docker stop <container>
+└─> crictl stopp <pod>
+
+Level 2: 正常删除
+├─> systemctl disable <service>
+├─> docker rm <container>
+└─> crictl rmp <pod>
+
+Level 3: 强制删除
+├─> rm -rf <directory>
+├─> docker rm -f <container>
+└─> crictl rmp -f <pod>
+```
+### 5.2 容错设计
+```go
+// 每个清理操作都有容错处理
+func cleanDockerKubelet() {
+    out, err := global.Command.ExecuteCommandWithCombinedOutput("/bin/sh", "-c", dockerStopKubelet)
+    if err != nil {
+        log.BKEFormat(log.WARN, fmt.Sprintf("stop kubelet container failed: %v", err))
+        log.Debugf("stop kubelet container output: %s", out)
+    } else {
+        out, err = global.Command.ExecuteCommandWithCombinedOutput("/bin/sh", "-c", dockerRemoveKubelet)
+        if err != nil {
+            log.BKEFormat(log.WARN, fmt.Sprintf("remove kubelet container failed: %v", err))
+            log.Debugf("remove kubelet container output: %s", out)
+        }
+    }
+    
+    // 如果上述失败，尝试强制删除
+    if err != nil {
+        out, err = global.Command.ExecuteCommandWithCombinedOutput("/bin/sh", "-c", dockerForceRemoveKubelet)
+        if err != nil {
+            log.BKEFormat(log.WARN, fmt.Sprintf("force remove kubelet container failed: %v", err))
+            log.Debugf("force remove kubelet container output: %s", out)
+        }
+    }
+}
+```
+**容错要点**：
+1. 每个操作都检查错误
+2. 失败后尝试下一级清理策略
+3. 记录详细的日志信息
+4. 不会因为某个步骤失败而中断整个流程
+## 六、运行时适配设计
+### 6.1 运行时检测
+```go
+// 检测 Docker
+if infrastructure.IsDocker() {
+    cleanDockerKubelet()
+    cleanDockerK8sContainers()
+    cleanDockerAllContainers()
+}
+
+// 检测 Containerd
+if infrastructure.IsContainerd() {
+    cleanContainerdKubelet()
+    cleanContainerdK8sContainers()
+    cleanContainerdAllContainers()
+}
+```
+### 6.2 工具差异
+| 操作 | Docker | Containerd |
+|------|--------|------------|
+| 列出容器 | `docker ps -a` | `crictl pods -q` |
+| 停止容器 | `docker stop` | `crictl stopp` |
+| 删除容器 | `docker rm` | `crictl rmp` |
+| 强制删除 | `docker rm -f` | `crictl rmp -f` |
+| 系统清理 | `docker system prune` | `nerdctl system prune` |
+## 七、使用示例
+### 7.1 基本清理
+```bash
+# 只删除本地 Kubernetes 集群
+bke reset
+
+# 清理效果：
+# - 删除 k3s 容器
+# - 删除 /etc/rancher 和 /var/lib/rancher
+```
+### 7.2 清理数据目录
+```bash
+# 删除解压目录和服务
+bke reset --mount
+
+# 清理效果：
+# - 删除本地 Kubernetes 集群
+# - 删除 mount 数据目录
+# - 删除容器服务（镜像仓库、YUM、Chart、NFS）
+# - 删除 NTP 服务
+```
+### 7.3 完全清理
+```bash
+# 恢复节点到初始状态（需要确认）
+bke reset --all
+
+# 清理效果：
+# - 删除本地 Kubernetes 集群
+# - 删除所有容器服务
+# - 删除 Kubelet
+# - 删除所有容器
+# - 删除容器运行时
+# - 清理网络配置
+# - 清理所有相关文件
+
+# 跳过确认（用于自动化脚本）
+bke reset --all --confirm
+```
+### 7.4 最彻底清理
+```bash
+# 完全清理 + 删除数据目录
+bke reset --all --mount
+
+# 清理效果：
+# - 所有 --all 的清理内容
+# - 删除 mount 数据目录
+```
+## 八、设计优势
+### 8.1 分级清理
+```
+优势：
+1. 灵活性：根据不同场景选择合适的清理级别
+2. 安全性：默认只清理最小范围
+3. 可控性：用户可以精确控制清理范围
+```
+### 8.2 安全确认
+```
+优势：
+1. 防止误操作：危险操作需要显式确认
+2. 自动化支持：--confirm 参数支持脚本化
+3. 用户友好：清晰的提示信息
+```
+### 8.3 全面覆盖
+```
+优势：
+1. 无残留：清理所有相关组件
+2. 网络清理：清理 iptables、路由、网卡
+3. 文件清理：清理所有配置文件和二进制文件
+```
+### 8.4 容错性强
+```
+优势：
+1. 多级策略：优雅停止 -> 正常删除 -> 强制删除
+2. 错误容忍：某个步骤失败不影响整体流程
+3. 详细日志：记录所有操作和错误信息
+```
+## 九、总结
+`bke reset` 命令的设计思路体现了以下核心思想：
+1. **分级清理**：提供多种清理级别，满足不同场景需求，从轻量级清理到完全重置
+2. **安全第一**：危险操作需要用户确认，防止误操作导致数据丢失
+3. **全面覆盖**：清理所有相关组件，包括容器、运行时、网络、文件等
+4. **运行时无关**：支持 Docker 和 Containerd 两种运行时，提高兼容性
+5. **容错设计**：采用三级清理策略，确保即使某些步骤失败也能完成清理
+6. **幂等性**：可重复执行，不会因已清理而失败
+
+这种设计使得 BKE 的节点清理更加安全、灵活和可靠，为用户提供了强大的环境重置能力。
+
+# `bke remove` 命令的设计思路
+## 一、命令定位与设计理念
+### 1.1 命令定位
+`bke remove` 命令的设计定位是：**删除引导节点上的单个基础服务**。
+### 1.2 与 bke reset 的区别
+```
+┌─────────────────────────────────────────────────────────────┐
+│              bke remove vs bke reset 对比                     │
+└─────────────────────────────────────────────────────────────┘
+bke remove
+├─> 定位：删除单个服务
+├─> 粒度：细粒度控制
+├─> 场景：服务维护、调试、单独删除
+└─> 特点：精确、灵活
+
+bke reset
+├─> 定位：批量清理节点
+├─> 粒度：粗粒度批量操作
+├─> 场景：节点重置、环境清理
+└─> 特点：全面、彻底
+```
+### 1.3 设计理念
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    bke remove 设计理念                        │
+└─────────────────────────────────────────────────────────────┘
+1. 模块化设计
+   └─> 每个服务独立删除，互不影响
+   
+2. 灵活性
+   └─> 支持默认名称和自定义名称
+   
+3. 安全性
+   └─> 删除前检查服务状态，避免误删
+   
+4. 幂等性
+   └─> 可重复执行，不会因已删除而失败
+   
+5. 完整性
+   └─> 删除容器、配置文件、相关进程
+```
+## 二、命令结构设计
+### 2.1 命令树结构
+```
+bke remove
+├── bke remove image [name]        # 删除镜像仓库服务
+├── bke remove yum [name]          # 删除 YUM 包仓库服务
+├── bke remove nfs [name]          # 删除 NFS 共享存储服务
+├── bke remove chart [name]        # 删除 Helm Chart 仓库服务
+└── bke remove ntpserver           # 删除 NTP 时间同步服务
+```
+### 2.2 参数设计
+| 子命令 | 参数 | 说明 | 默认值 |
+|--------|------|------|--------|
+| `image` | `[name]` | 容器名称 | `bocloud_image_registry` |
+| `yum` | `[name]` | 容器名称 | `bocloud_yum_registry` |
+| `nfs` | `[name]` | 容器名称 | `bocloud_nfs_registry` |
+| `chart` | `[name]` | 容器名称 | `bocloud_chart_registry` |
+| `ntpserver` | 无 | - | - |
+
+**设计要点**：
+- 使用位置参数而非标志参数，简化命令
+- 支持自定义容器名称，便于管理多个实例
+- 提供合理的默认值，开箱即用
+## 三、核心删除逻辑设计
+### 3.1 统一删除接口
+所有服务的删除都遵循统一的接口模式：
+```go
+func RemoveXxxService(name string) error {
+    log.BKEFormat(log.INFO, "Remove the xxx repository")
+    
+    // 1. 删除配置文件（如果有）
+    if err := os.RemoveAll("/path/to/config"); err != nil {
+        log.BKEFormat(log.WARN, fmt.Sprintf("Failed to remove config: %v", err))
+    }
+    
+    // 2. 删除容器（带重试机制）
+    return removeContainerWithRetry(name, cleanupFunc)
+}
+```
+### 3.2 镜像仓库删除
+```go
+func RemoveImageRegistry(name string) error {
+    log.BKEFormat(log.INFO, "Remove the image repository")
+    
+    // 1. 删除证书配置文件
+    if err := os.RemoveAll("/etc/docker/" + name); err != nil {
+        log.BKEFormat(log.WARN, fmt.Sprintf("Failed to remove /etc/docker/%s: %v", name, err))
+    }
+    
+    // 2. 删除容器（带重试）
+    return removeContainerWithRetry(name, nil)
+}
+```
+**删除内容**：
+- 证书文件：`/etc/docker/<name>/`
+- 容器实例：`<name>`
+### 3.3 YUM 仓库删除
+```go
+func RemoveYumRegistry(name string) error {
+    log.BKEFormat(log.INFO, "Remove the yum repository")
+    
+    // 删除容器（无额外清理）
+    return removeContainerWithRetry(name, nil)
+}
+```
+**删除内容**：
+- 容器实例：`<name>`
+- 配置文件在容器内，随容器删除而清理
+### 3.4 Chart 仓库删除
+```go
+func RemoveChartRegistry(name string) error {
+    log.BKEFormat(log.INFO, "Remove the chart repository")
+    
+    // 删除容器（无额外清理）
+    return removeContainerWithRetry(name, nil)
+}
+```
+**删除内容**：
+- 容器实例：`<name>`
+### 3.5 NFS 服务删除
+```go
+func RemoveNFSServer(name string) error {
+    log.BKEFormat(log.INFO, "Remove the nfs repository")
+    
+    // NFS 特殊清理：杀死 nfsd 进程
+    nfsdCleanup := func() {
+        _ = global.Command.ExecuteCommand("sh", "-c", 
+            "ps aux | grep nfsd | awk '{print $2}' | xargs kill -9")
+    }
+    
+    // 删除容器（带特殊清理）
+    return removeContainerWithRetry(name, nfsdCleanup)
+}
+```
+**删除内容**：
+- 容器实例：`<name>`
+- NFS 进程：`nfsd` 相关进程
+
+**特殊处理**：
+- NFS 服务需要在容器删除前清理相关进程
+- 使用 `cleanupFunc` 参数传递清理函数
+### 3.6 NTP 服务删除
+```go
+func RemoveNTPServer() error {
+    var err error
+    
+    // 1. 删除 systemd 服务（如果存在）
+    if utils.Exists("/etc/systemd/system/ntpserver.service") {
+        // 1.1 禁用服务
+        err = global.Command.ExecuteCommand("sh", "-c", 
+            "sudo systemctl disable ntpserver.service")
+        
+        // 1.2 停止服务
+        err = global.Command.ExecuteCommand("sh", "-c", 
+            "sudo systemctl stop ntpserver.service")
+        
+        // 1.3 删除服务文件
+        err = os.Remove("/etc/systemd/system/ntpserver.service")
+        
+        // 1.4 重载 systemd
+        err = global.Command.ExecuteCommand("sh", "-c", 
+            "sudo systemctl daemon-reload")
+    }
+    
+    // 2. 杀死进程（如果存在）
+    pids, err := process.Pids()
+    for _, pid := range pids {
+        pn, err := process.NewProcess(pid)
+        cmd, err := pn.Cmdline()
+        
+        // 查找并杀死 bke start ntpserver 进程
+        if strings.Contains(cmd, "bke start ntpserver") {
+            err = syscall.Kill(int(pid), syscall.SIGKILL)
+        }
+    }
+    
+    // 3. 删除日志文件
+    if err := os.Remove(logFile); err != nil && !os.IsNotExist(err) {
+        log.BKEFormat(log.WARN, fmt.Sprintf("Failed to remove log file: %v", err))
+    }
+    
+    log.BKEFormat(log.INFO, "Remove the ntp server")
+    return nil
+}
+```
+**删除内容**：
+- systemd 服务文件：`/etc/systemd/system/ntpserver.service`
+- NTP 进程：`bke start ntpserver` 相关进程
+- 日志文件：`/tmp/ntpserver.log`
+## 四、核心删除机制
+### 4.1 容器删除重试机制
+```go
+// removeContainerWithRetry 移除容器，支持重试和额外清理操作
+func removeContainerWithRetry(name string, extraCleanup func()) error {
+    if infrastructure.IsDocker() {
+        for i := 0; i < 2; i++ {
+            // 1. 删除容器
+            _ = global.Docker.ContainerRemove(name)
+            
+            // 2. 执行额外清理（如果有）
+            if extraCleanup != nil {
+                extraCleanup()
+            }
+            
+            // 3. 检查容器是否还存在
+            _, exist := global.Docker.ContainerExists(name)
+            if exist {
+                time.Sleep(utils.ContainerRemoveWaitSeconds * time.Second)
+            } else {
+                break
+            }
+        }
+        return nil
+    }
+    
+    if infrastructure.IsContainerd() {
+        for i := 0; i < 2; i++ {
+            // 1. 删除容器
+            _ = econd.ContainerRemove(name)
+            
+            // 2. 执行额外清理（如果有）
+            if extraCleanup != nil {
+                extraCleanup()
+            }
+            
+            // 3. 检查容器是否还存在
+            _, exist := econd.ContainerExists(name)
+            if exist {
+                time.Sleep(utils.ContainerRemoveWaitSeconds * time.Second)
+            } else {
+                break
+            }
+        }
+        return nil
+    }
+    
+    return nil
+}
+```
+**重试策略**：
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    容器删除重试流程                           │
+└─────────────────────────────────────────────────────────────┘
+
+第1次尝试
+├─> 删除容器
+├─> 执行额外清理
+├─> 检查容器是否存在
+│   ├─> 不存在：成功退出
+│   └─> 存在：等待 ContainerRemoveWaitSeconds 秒
+│
+第2次尝试
+├─> 删除容器
+├─> 执行额外清理
+└─> 检查容器是否存在
+    ├─> 不存在：成功退出
+    └─> 存在：退出（不再重试）
+```
+### 4.2 运行时适配
+```go
+// 根据运行时类型选择删除方法
+if infrastructure.IsDocker() {
+    // Docker 删除逻辑
+    global.Docker.ContainerRemove(name)
+    _, exist := global.Docker.ContainerExists(name)
+}
+
+if infrastructure.IsContainerd() {
+    // Containerd 删除逻辑
+    econd.ContainerRemove(name)
+    _, exist := econd.ContainerExists(name)
+}
+```
+## 五、与 bke cluster remove 的区别
+### 5.1 两个层面的删除
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    删除操作的两个层面                         │
+└─────────────────────────────────────────────────────────────┘
+层面1: 基础服务层
+├─> 命令：bke remove <service>
+├─> 对象：引导节点上的基础服务
+├─> 实现：删除容器和配置文件
+└─> 示例：bke remove image
+
+层面2: 业务集群层
+├─> 命令：bke cluster remove <namespace/name>
+├─> 对象：业务集群
+├─> 实现：设置 BKECluster.Spec.Reset = true
+└─> 示例：bke cluster remove bke-cluster/my-cluster
+```
+### 5.2 业务集群删除逻辑
+```go
+func (op *Options) Remove() {
+    // 1. 解析参数（namespace/name 格式）
+    ns := strings.Split(op.Args[0], "/")
+    if len(ns) < nsNamePartsCount {
+        log.Error("invalid argument format, expected namespace/name")
+        return
+    }
+    
+    // 2. 获取 BKECluster 资源
+    dynamicClient := global.K8s.GetDynamicClient()
+    workloadUnstructured, err := dynamicClient.Resource(gvr).Namespace(ns[0]).
+        Get(context.TODO(), ns[1], metav1.GetOptions{})
+    if err != nil {
+        log.Error(err.Error())
+        return
+    }
+    
+    // 3. 转换为 BKECluster 对象
+    bcluster := &configv1beta1.BKECluster{}
+    err = runtime.DefaultUnstructuredConverter.FromUnstructured(
+        workloadUnstructured.UnstructuredContent(), bcluster)
+    
+    // 4. 设置 Reset 标志为 true
+    bcluster.Spec.Reset = true
+    
+    // 5. 更新资源
+    t1, err := runtime.DefaultUnstructuredConverter.ToUnstructured(bcluster)
+    m1 := &unstructured.Unstructured{Object: t1}
+    _, err = dynamicClient.Resource(gvr).Namespace(bcluster.Namespace).
+        Update(context.TODO(), m1, metav1.UpdateOptions{})
+}
+```
+**删除机制**：
+- 不直接删除资源，而是设置 `Reset = true`
+- 由 cluster-api-provider-bke 控制器执行实际删除
+- 声明式删除，符合 Kubernetes 设计理念
+### 5.3 删除流程对比
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    删除流程对比                               │
+└─────────────────────────────────────────────────────────────┘
+bke remove image
+├─> 直接删除容器
+├─> 删除配置文件
+└─> 立即生效
+
+bke cluster remove bke-cluster/my-cluster
+├─> 设置 BKECluster.Spec.Reset = true
+├─> 控制器检测到变更
+├─> 控制器执行清理逻辑
+│   ├─> 删除节点
+│   ├─> 清理网络
+│   └─> 清理存储
+└─> 删除 BKECluster 资源
+```
+## 六、使用示例
+### 6.1 删除镜像仓库
+```bash
+# 使用默认名称删除
+bke remove image
+
+# 删除指定名称的镜像仓库
+bke remove image my-custom-registry
+```
+### 6.2 删除 YUM 仓库
+```bash
+# 使用默认名称删除
+bke remove yum
+
+# 删除指定名称的 YUM 仓库
+bke remove yum my-custom-yum
+```
+### 6.3 删除 NFS 服务
+```bash
+# 使用默认名称删除
+bke remove nfs
+
+# 删除指定名称的 NFS 服务
+bke remove nfs my-custom-nfs
+```
+### 6.4 删除 Chart 仓库
+```bash
+# 使用默认名称删除
+bke remove chart
+
+# 删除指定名称的 Chart 仓库
+bke remove chart my-custom-chart
+```
+### 6.5 删除 NTP 服务
+```bash
+# 删除 NTP 服务
+bke remove ntpserver
+```
+### 6.6 删除业务集群
+```bash
+# 删除业务集群
+bke cluster remove bke-cluster/my-cluster
+```
+## 七、设计优势
+### 7.1 模块化
+```
+优势：
+1. 每个服务独立删除，互不影响
+2. 可以精确控制删除范围
+3. 便于维护和调试
+```
+### 7.2 灵活性
+```
+优势：
+1. 支持默认名称，简化常用操作
+2. 支持自定义名称，满足特殊需求
+3. 位置参数设计，命令简洁
+```
+### 7.3 安全性
+```
+优势：
+1. 删除前检查服务状态
+2. 重试机制确保删除成功
+3. 详细的日志输出
+```
+### 7.4 完整性
+```
+优势：
+1. 删除容器实例
+2. 删除配置文件
+3. 清理相关进程
+4. 清理 systemd 服务
+```
+### 7.5 幂等性
+```
+优势：
+1. 可重复执行
+2. 不会因已删除而失败
+3. 适合自动化脚本
+```
+## 八、删除操作矩阵
+| 服务 | 容器删除 | 配置删除 | 进程清理 | systemd 清理 | 支持自定义名称 |
+|------|----------|----------|----------|--------------|----------------|
+| image | ✅ | ✅ | ❌ | ❌ | ✅ |
+| yum | ✅ | ❌ | ❌ | ❌ | ✅ |
+| nfs | ✅ | ❌ | ✅ | ❌ | ✅ |
+| chart | ✅ | ❌ | ❌ | ❌ | ✅ |
+| ntpserver | ❌ | ❌ | ✅ | ✅ | ❌ |
+## 九、总结
+`bke remove` 命令的设计思路体现了以下核心思想：
+1. **模块化设计**：每个服务独立删除，互不影响，便于精确控制
+2. **灵活性**：支持默认名称和自定义名称，满足不同场景需求
+3. **安全性**：删除前检查状态，重试机制确保删除成功
+4. **完整性**：删除容器、配置文件、相关进程，确保无残留
+5. **幂等性**：可重复执行，不会因已删除而失败
+6. **运行时无关**：支持 Docker 和 Containerd 两种运行时
+
+这种设计使得 BKE 的服务管理更加灵活、安全和可靠，为用户提供了精确的服务删除能力，与 `bke reset` 的批量清理形成互补，满足不同场景的需求。
+
+# `bke config` 命令的设计思路
+## 一、命令定位与设计理念
+### 1.1 命令定位
+`bke config` 命令的设计定位是：**生成和管理 BKE 集群配置文件**。
+### 1.2 设计理念
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    bke config 设计理念                      │
+└─────────────────────────────────────────────────────────────┘
+1. 模板化设计
+   └─> 预定义多种场景的配置模板，开箱即用
+   
+2. 产品化支持
+   └─> 支持不同产品的特定配置需求
+   
+3. 安全性优先
+   └─> 密码加密存储，保护敏感信息
+   
+4. 灵活性
+   └─> 支持自定义配置，满足特殊需求
+   
+5. 易用性
+   └─> 提供合理的默认值，简化配置过程
+```
+## 二、命令结构设计
+### 2.1 命令树结构
+```
+bke config
+├── bke config                          # 生成集群配置文件
+├── bke config encrypt [string]         # 加密字符串
+├── bke config encrypt -f <file>        # 加密配置文件
+├── bke config decrypt [string]         # 解密字符串
+└── bke config decrypt -f <file>        # 解密配置文件
+```
+### 2.2 参数设计
+#### bke config 参数
+| 参数 | 简写 | 说明 | 默认值 |
+|------|------|------|--------|
+| `--directory` | `-d` | 配置文件目录 | 当前目录 |
+| `--product` | `-p` | 产品类型 | `boc4.0-portal` |
+
+**产品类型枚举**：
+- `fuyao-portal`：扶摇门户
+- `fuyao-business`：扶摇业务
+- `fuyao-allinone`：扶摇全量
+#### bke config encrypt/decrypt 参数
+| 参数 | 简写 | 说明 | 必需 |
+|------|------|------|------|
+| `--file` | `-f` | 配置文件路径 | 二选一 |
+| `[string]` | - | 要加密/解密的字符串 | 二选一 |
+## 三、配置生成设计
+### 3.1 配置生成流程
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    配置生成流程                               │
+└─────────────────────────────────────────────────────────────┘
+
+开始
+  │
+  ├─> ensureDirectory()           # 确保目录存在
+  │
+  ├─> createBKECluster()          # 创建 BKECluster 基础对象
+  │
+  ├─> initBaseConfig()            # 初始化基础配置
+  │     └─> ConvertBkEConfig()    # 转换默认配置
+  │
+  ├─> optimizeKubeClient()        # 优化 Kubernetes 客户端配置
+  │     ├─> APIServer 配置
+  │     ├─> ControllerManager 配置
+  │     ├─> Scheduler 配置
+  │     └─> Kubelet 配置
+  │
+  ├─> applyBocCustomConfig()      # 应用自定义配置
+  │     ├─> 设置版本号
+  │     ├─> 设置容器运行时
+  │     └─> product()             # 应用产品特定配置
+  │           ├─> setBaseAddons()           # 设置基础插件
+  │           └─> applyProductSpecificConfig() # 应用产品配置
+  │
+  └─> generateConfigFiles()       # 生成配置文件
+        ├─> master1()             # 单节点配置
+        ├─> master1node1()        # 1主1从配置
+        └─> master3()             # 3主配置
+```
+### 3.2 配置文件结构
+生成的配置文件采用 **BKECluster + BKENode** 分离结构：
+```
+<directory>/
+├── 1master-cluster.yaml          # 单节点集群配置
+├── 1master-node.yaml             # 单节点节点配置
+├── 1master1node-cluster.yaml     # 1主1从集群配置
+├── 1master1node-nodes.yaml       # 1主1从节点配置
+├── 3master-cluster.yaml          # 3主集群配置
+└── 3master-nodes.yaml            # 3主节点配置
+```
+**设计优势**：
+- 配置与节点分离，便于管理
+- 支持多节点场景，扩展性好
+- 符合 Kubernetes CRD 规范
+### 3.3 BKECluster 配置结构
+```yaml
+apiVersion: bke.bocloud.com/v1beta1
+kind: BKECluster
+metadata:
+  name: bke-cluster
+  namespace: bke-cluster
+spec:
+  pause: false
+  dryRun: false
+  reset: false
+  clusterConfig:
+    kubernetesVersion: v1.34.3-of.1
+    etcdVersion: v3.6.7-of.1
+    containerdVersion: v2.1.1
+    openFuyaoVersion: latest
+    
+    # 容器运行时配置
+    containerRuntime:
+      cri: containerd
+      runtime: runc
+      param:
+        data-root: /var/lib/containerd
+    
+    # 镜像仓库配置
+    imageRepo:
+      domain: registry.bocloud.com
+      ip: 0.0.0.0
+      port: "443"
+      prefix: kubernetes
+    
+    # 控制平面配置
+    apiServer:
+      extraArgs:
+        max-mutating-requests-inflight: "3000"
+        max-requests-inflight: "1000"
+    
+    # 插件配置
+    addons:
+    - name: kubeproxy
+      version: v1.34.3-of.1
+    - name: calico
+      version: v3.31.3
+    - name: coredns
+      version: v1.12.2-of.1
+```
+### 3.4 BKENode 配置结构
+```yaml
+apiVersion: bke.bocloud.com/v1beta1
+kind: BKENode
+metadata:
+  name: bke-cluster-m1
+  namespace: bke-cluster
+  labels:
+    cluster.x-k8s.io/cluster-name: bke-cluster
+spec:
+  hostname: m1
+  ip: 127.0.0.2
+  username: root
+  password: ******  # 加密后的密码
+  port: "22"
+  role:
+  - master/node
+  - etcd
+```
+## 四、场景化配置设计
+### 4.1 单节点配置（master1）
+```go
+func master1(directory string, cluster configv1beta1.BKECluster, cfg *confv1beta1.BKEConfig) {
+    cfg1 := cfg.DeepCopy()
+    
+    // 创建单节点定义
+    nodeDefs := []nodeDef{
+        newMasterEtcdNodeDef("m1", "127.0.0.2", "root", "******"),
+    }
+    nodes := createBKENodes(cluster.Name, cluster.Namespace, nodeDefs)
+    
+    // 根据节点数量更新 CoreDNS 反亲和性
+    updateCorednsAntiAffinityByCount(cfg1, len(nodes))
+    
+    cluster.Spec.ClusterConfig = cfg1
+    writeClusterAndNodesConfig(directory, "1master", cluster, nodes, true)
+}
+```
+**适用场景**：
+- 开发测试环境
+- 功能验证
+- 学习实验
+
+**配置特点**：
+- 1个 master 节点
+- master 同时作为 etcd 和 node
+- CoreDNS 不启用反亲和性
+### 4.2 1主1从配置（master1node1）
+```go
+func master1node1(directory string, cluster configv1beta1.BKECluster, cfg *confv1beta1.BKEConfig) {
+    cfg1 := cfg.DeepCopy()
+    
+    nodeDefs := []nodeDef{
+        newMasterEtcdNodeDef("m1", "127.0.0.1", "u1", "******"),
+        {
+            Hostname: "n1",
+            IP:       "127.0.0.2",
+            Username: "user2",
+            Password: "******",
+            Port:     "22",
+            Role:     []string{"node"},
+        },
+    }
+    nodes := createBKENodes(cluster.Name, cluster.Namespace, nodeDefs)
+    
+    updateCorednsAntiAffinityByCount(cfg1, len(nodes))
+    
+    cluster.Spec.ClusterConfig = cfg1
+    writeClusterAndNodesConfig(directory, "1master1node", cluster, nodes, false)
+}
+```
+**适用场景**：
+- 小规模生产环境
+- 功能演示
+- 性能测试
+
+**配置特点**：
+- 1个 master 节点（etcd）
+- 1个 worker 节点
+- CoreDNS 启用反亲和性
+### 4.3 3主配置（master3）
+```go
+func master3(directory string, cluster configv1beta1.BKECluster, cfg *confv1beta1.BKEConfig) {
+    cfg1 := cfg.DeepCopy()
+    
+    nodeDefs := []nodeDef{
+        newMasterEtcdNodeDef("master-1", "127.0.0.1", "user1", "******"),
+        newMasterEtcdNodeDef("master-2", "127.0.0.2", "user2", "******"),
+        newMasterEtcdNodeDef("master-3", "127.0.0.3", "user3", "******"),
+    }
+    nodes := createBKENodes(cluster.Name, cluster.Namespace, nodeDefs)
+    
+    updateCorednsAntiAffinityByCount(cfg1, len(nodes))
+    
+    // 设置 VIP
+    cluster.Spec.ControlPlaneEndpoint = confv1beta1.APIEndpoint{
+        Host: "0.0.0.0(vip)",
+        Port: 6443,
+    }
+    
+    cluster.Spec.ClusterConfig = cfg1
+    writeClusterAndNodesConfig(directory, "3master", cluster, nodes, false)
+}
+```
+**适用场景**：
+- 生产环境
+- 高可用集群
+- 关键业务
+
+**配置特点**：
+- 3个 master 节点（etcd 集群）
+- 高可用架构
+- VIP 负载均衡
+- CoreDNS 启用反亲和性
+## 五、产品化配置设计
+### 5.1 产品配置流程
+```go
+func (op *Options) product(cfg *confv1beta1.BKEConfig, yumRepo confv1beta1.Repo) *configv1beta1.BKEConfig {
+    sandbox, offline := op.generateControllerParams()
+    
+    // 设置基础插件
+    op.setBaseAddons(cfg)
+    
+    // 应用产品特定配置
+    op.applyProductSpecificConfig(cfg, sandbox, offline)
+    
+    return cfg
+}
+```
+### 5.2 基础插件配置
+```go
+func (op *Options) setBaseAddons(cfg *confv1beta1.BKEConfig) {
+    cfg.Addons = []confv1beta1.Product{
+        {
+            Name:    "kubeproxy",
+            Version: "v1.34.3-of.1",
+            Param: map[string]string{
+                "clusterNetworkMode": "calico",
+            },
+        },
+        {
+            Block:   true,  # 阻塞式安装
+            Name:    "calico",
+            Version: "v3.31.3",
+            Param: map[string]string{
+                "calicoMode":            "vxlan",
+                "ipAutoDetectionMethod": "skip-interface=nerdctl*",
+                "allowTypha":            "false",
+                "typhaReplicas":         "1",
+            },
+        },
+        {
+            Name:    "coredns",
+            Version: "v1.12.2-of.1",
+        },
+        {
+            Name:    "bkeagent-deployer",
+            Version: "latest",
+            Param: map[string]string{
+                "tagVersion": "latest",
+            },
+        },
+    }
+}
+```
+**插件说明**：
+- **kubeproxy**：Kubernetes 网络代理
+- **calico**：网络插件（阻塞式安装，确保网络就绪）
+- **coredns**：DNS 服务
+- **bkeagent-deployer**：BKE Agent 部署器
+### 5.3 产品特定配置
+```go
+func (op *Options) applyProductSpecificConfig(cfg *confv1beta1.BKEConfig, sandbox, offline string) {
+    switch op.Product {
+    case "fuyao-portal":
+        op.applyFuyaoPortalConfig(cfg, sandbox, offline)
+    case "fuyao-business":
+        // fuyao-business 只需要设置 Kubernetes 版本
+    case "fuyao-allinone":
+        op.applyFuyaoAllInOneConfig(cfg, sandbox, offline)
+    default:
+        op.logUnsupportedProduct()
+    }
+}
+```
+**产品差异**：
+
+| 产品 | 说明 | 特殊配置 |
+|------|------|----------|
+| fuyao-portal | 扶摇门户 | 标准配置 + 门户特定插件 |
+| fuyao-business | 扶摇业务 | 最小化配置，只设置版本 |
+| fuyao-allinone | 扶摇全量 | 全量插件 + 所有组件 |
+## 六、密码加密设计
+### 6.1 加密机制
+```go
+// 使用 AES 加密算法
+func (op *Options) EncryptString() error {
+    for _, arg := range op.Args {
+        p, err := security.AesEncrypt(arg)
+        if err != nil {
+            return err
+        }
+        fmt.Println(p)
+    }
+    return nil
+}
+
+func (op *Options) DecryptString() error {
+    for _, arg := range op.Args {
+        p, err := security.AesDecrypt(arg)
+        if err != nil {
+            return err
+        }
+        fmt.Println(p)
+    }
+    return nil
+}
+```
+### 6.2 文件加密流程
+```go
+func (op *Options) processNodesFile(nodesFile string, isEncrypt bool) error {
+    // 1. 加载 BKENode 文件
+    nodes, err := op.loadBKENodes(nodesFile)
+    if err != nil {
+        return err
+    }
+    
+    // 2. 加密/解密每个节点的密码
+    for i := range nodes {
+        if isEncrypt {
+            nodes[i] = op.encryptBKENodePassword(nodes[i])
+        } else {
+            nodes[i] = op.decryptBKENodePassword(nodes[i])
+        }
+    }
+    
+    // 3. 保存处理后的文件
+    return op.saveBKENodes(nodesFile, nodes, isEncrypt)
+}
+
+func (op *Options) encryptBKENodePassword(node confv1beta1.BKENode) confv1beta1.BKENode {
+    // 检查是否已加密
+    _, err := security.AesDecrypt(node.Spec.Password)
+    if err == nil {
+        // 已加密，跳过
+        return node
+    }
+    
+    // 加密密码
+    encrypted, err := security.AesEncrypt(node.Spec.Password)
+    if err != nil {
+        log.BKEFormat(log.WARN, fmt.Sprintf("Failed to encrypt password for node %s: %v", 
+            node.Spec.Hostname, err))
+        return node
+    }
+    
+    node.Spec.Password = encrypted
+    return node
+}
+```
+### 6.3 加密设计要点
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    密码加密设计要点                           │
+└─────────────────────────────────────────────────────────────┘
+
+1. 加密算法
+   └─> AES 对称加密算法
+   
+2. 加密时机
+   ├─> 配置生成时：默认密码（******）不加密
+   └─> 用户修改后：手动执行加密命令
+   
+3. 幂等性
+   └─> 已加密的密码不会重复加密
+   
+4. 安全性
+   ├─> 密码不明文存储
+   └─> 加密密钥由系统管理
+```
+## 七、Kubernetes 优化配置
+### 7.1 APIServer 优化
+```go
+cfg.Cluster.APIServer = &confv1beta1.APIServer{
+    ControlPlaneComponent: confv1beta1.ControlPlaneComponent{
+        ExtraArgs: map[string]string{
+            "max-mutating-requests-inflight": "3000",  // 最大 mutating 请求数
+            "max-requests-inflight":          "1000",  // 最大请求数
+            "watch-cache-sizes":              "node#1000,pod#5000",  // watch 缓存大小
+        },
+    },
+}
+```
+**优化目标**：
+- 提高并发处理能力
+- 优化 watch 性能
+- 适应大规模集群
+### 7.2 ControllerManager 优化
+```go
+cfg.Cluster.ControllerManager = &confv1beta1.ControlPlaneComponent{
+    ExtraArgs: map[string]string{
+        "kube-api-qps":   "1000",  // API QPS 限制
+        "kube-api-burst": "1000",  // API Burst 限制
+    },
+}
+```
+### 7.3 Kubelet 优化
+```go
+cfg.Cluster.Kubelet = &confv1beta1.Kubelet{
+    ControlPlaneComponent: confv1beta1.ControlPlaneComponent{
+        ExtraArgs: map[string]string{
+            "kube-api-qps":   "1000",
+            "kube-api-burst": "2000",
+        },
+        ExtraVolumes: []confv1beta1.HostPathMount{
+            {
+                Name:     "kubelet-root-dir",
+                HostPath: "/var/lib/kubelet",
+            },
+        },
+    },
+}
+```
+## 八、CoreDNS 反亲和性设计
+### 8.1 根据节点数量动态调整
+```go
+func updateCorednsAntiAffinityByCount(cfg *confv1beta1.BKEConfig, nodeCount int) {
+    enableAntiAffinity := "false"
+    if nodeCount > 1 {
+        enableAntiAffinity = "true"
+    }
+    
+    for i := range cfg.Addons {
+        if cfg.Addons[i].Name == "coredns" {
+            if cfg.Addons[i].Param == nil {
+                cfg.Addons[i].Param = make(map[string]string)
+            }
+            cfg.Addons[i].Param["EnableAntiAffinity"] = enableAntiAffinity
+            break
+        }
+    }
+}
+```
+**设计思路**：
+- **单节点**：禁用反亲和性，避免调度失败
+- **多节点**：启用反亲和性，提高可用性
+## 九、使用示例
+### 9.1 生成配置文件
+```bash
+# 使用默认配置生成
+bke config
+
+# 指定目录和产品
+bke config -d /path/to/config -p fuyao-portal
+
+# 生成结果：
+# /path/to/config/
+# ├── 1master-cluster.yaml
+# ├── 1master-node.yaml
+# ├── 1master1node-cluster.yaml
+# ├── 1master1node-nodes.yaml
+# ├── 3master-cluster.yaml
+# └── 3master-nodes.yaml
+```
+### 9.2 加密密码
+```bash
+# 加密单个字符串
+bke config encrypt mypassword
+# 输出：U2FsdGVkX1+...
+
+# 加密配置文件
+bke config encrypt -f 1master-node.yaml
+# 生成：1master-encrypt.yaml
+
+# 加密节点文件
+bke config encrypt -f 1master-nodes.yaml
+```
+### 9.3 解密密码
+```bash
+# 解密单个字符串
+bke config decrypt U2FsdGVkX1+...
+# 输出：mypassword
+
+# 解密配置文件
+bke config decrypt -f 1master-node.yaml
+# 生成：1master-decrypt.yaml
+```
+## 十、设计优势
+### 10.1 模板化
+```
+优势：
+1. 预定义多种场景，开箱即用
+2. 减少配置错误
+3. 快速部署
+```
+### 10.2 产品化
+```
+优势：
+1. 支持不同产品需求
+2. 灵活配置
+3. 易于扩展
+```
+### 10.3 安全性
+```
+优势：
+1. 密码加密存储
+2. AES 加密算法
+3. 幂等性保证
+```
+### 10.4 易用性
+```
+优势：
+1. 合理的默认值
+2. 简单的命令
+3. 清晰的输出
+```
+## 十一、总结
+`bke config` 命令的设计思路体现了以下核心思想：
+1. **模板化设计**：预定义多种场景的配置模板，降低配置复杂度
+2. **产品化支持**：支持不同产品的特定配置需求，灵活适应业务场景
+3. **安全性优先**：密码加密存储，保护敏感信息
+4. **场景化配置**：针对不同规模和场景提供优化配置
+5. **易用性**：提供合理的默认值和简单的命令，降低使用门槛
+
+这种设计使得 BKE 的配置管理更加简单、安全和灵活，为用户提供了开箱即用的配置模板，同时支持自定义配置满足特殊需求。
+
+    
+# 详细分析这三个产品参数在配置生成上的区别。
+## bke config 三种产品参数的配置区别
+### 一、代码实现分析
+根据 [config.go:380-404](file:///D:\code\github\bkeadm\pkg\config\config.go#L380-L404) 的实现：
+```go
+// applyProductSpecificConfig 应用产品特定配置
+func (op *Options) applyProductSpecificConfig(cfg *confv1beta1.BKEConfig, sandbox, offline string) {
+    switch op.Product {
+    case "fuyao-portal":
+        op.applyFuyaoPortalConfig(cfg, sandbox, offline)
+    case "fuyao-business":
+        // fuyao-business 只需要设置 Kubernetes 版本，已在上面设置
+    case "fuyao-allinone":
+        op.applyFuyaoAllInOneConfig(cfg, sandbox, offline)
+    default:
+        op.logUnsupportedProduct()
+    }
+}
+```
+### 二、三种产品的配置差异对比
+```
+┌─────────────────────────────────────────────────────────────┐
+│              三种产品配置对比表                               │
+├──────────────────┬──────────────────┬──────────────────────┤
+│     产品类型     │   插件配置       │       说明           │
+├──────────────────┼──────────────────┼──────────────────────┤
+│ fuyao-portal     │ cluster-api      │ 扶摇门户场景         │
+│ (扶摇门户)       │ openfuyao-system │ 需要完整的集群管理   │
+│                  │ -controller      │ 能力                 │
+├──────────────────┼──────────────────┼──────────────────────┤
+│ fuyao-business   │ 无额外插件       │ 扶摇业务场景         │
+│ (扶摇业务)       │                  │ 仅需要基础K8s集群    │
+│                  │                  │ 不需要集群管理能力   │
+├──────────────────┼──────────────────┼──────────────────────┤
+│ fuyao-allinone   │ cluster-api      │ 扶摇全量场景         │
+│ (扶摇全量)       │ openfuyao-system │ 包含所有功能组件     │
+│                  │ -controller      │                      │
+└──────────────────┴──────────────────┴──────────────────────┘
+```
+### 三、详细配置差异
+#### 3.1 fuyao-portal (扶摇门户)
+**实现代码**：
+```go
+func (op *Options) applyFuyaoPortalConfig(cfg *confv1beta1.BKEConfig, sandbox, offline string) {
+    op.applyFuyaoCommonConfig(cfg, sandbox, offline)
+}
+```
+**生成的插件配置**：
+```yaml
+Addons:
+  # 基础插件（所有产品都有）
+  - Name: kubeproxy
+    Version: v1.34.3-of.1
+    Param:
+      clusterNetworkMode: calico
+  
+  - Name: calico
+    Version: v3.31.3
+    Block: true
+    Param:
+      calicoMode: vxlan
+      ipAutoDetectionMethod: skip-interface=nerdctl*
+      allowTypha: false
+      typhaReplicas: "1"
+  
+  - Name: coredns
+    Version: v1.12.2-of.1
+  
+  - Name: bkeagent-deployer
+    Version: latest
+    Param:
+      tagVersion: latest
+  
+  # 门户特有插件
+  - Name: cluster-api
+    Version: v1.4.3
+    Block: true
+    Param:
+      manage: "true"
+      offline: "false"
+      sandbox: "sandbox-image"
+      replicas: "1"
+      containerdVersion: v2.1.1
+      openFuyaoVersion: latest
+      manifestsVersion: latest
+      providerVersion: latest
+  
+  - Name: openfuyao-system-controller
+    Version: latest
+    Param:
+      helmRepo: https://helm.openfuyao.cn/_core
+      tagVersion: latest
+```
+**适用场景**：
+- 扶摇门户产品部署
+- 需要集群管理能力（创建、删除、扩缩容集群）
+- 需要与 OpenFuyao 平台集成
+#### 3.2 fuyao-business (扶摇业务)
+**实现代码**：
+```go
+case "fuyao-business":
+    // fuyao-business 只需要设置 Kubernetes 版本，已在上面设置
+```
+**生成的插件配置**：
+```yaml
+Addons:
+  # 仅包含基础插件
+  - Name: kubeproxy
+    Version: v1.34.3-of.1
+    Param:
+      clusterNetworkMode: calico
+  
+  - Name: calico
+    Version: v3.31.3
+    Block: true
+    Param:
+      calicoMode: vxlan
+      ipAutoDetectionMethod: skip-interface=nerdctl*
+      allowTypha: false
+      typhaReplicas: "1"
+  
+  - Name: coredns
+    Version: v1.12.2-of.1
+  
+  - Name: bkeagent-deployer
+    Version: latest
+    Param:
+      tagVersion: latest
+```
+**适用场景**：
+- 扶摇业务产品部署
+- 仅需要运行业务应用
+- 不需要集群管理能力
+- 轻量化部署场景
+#### 3.3 fuyao-allinone (扶摇全量)
+**实现代码**：
+```go
+func (op *Options) applyFuyaoAllInOneConfig(cfg *confv1beta1.BKEConfig, sandbox, offline string) {
+    op.applyFuyaoCommonConfig(cfg, sandbox, offline)
+}
+```
+
+**生成的插件配置**：
+```yaml
+Addons:
+  # 基础插件（所有产品都有）
+  - Name: kubeproxy
+    Version: v1.34.3-of.1
+    Param:
+      clusterNetworkMode: calico
+  
+  - Name: calico
+    Version: v3.31.3
+    Block: true
+    Param:
+      calicoMode: vxlan
+      ipAutoDetectionMethod: skip-interface=nerdctl*
+      allowTypha: false
+      typhaReplicas: "1"
+  
+  - Name: coredns
+    Version: v1.12.2-of.1
+  
+  - Name: bkeagent-deployer
+    Version: latest
+    Param:
+      tagVersion: latest
+  
+  # 全量特有插件（与门户相同）
+  - Name: cluster-api
+    Version: v1.4.3
+    Block: true
+    Param:
+      manage: "true"
+      offline: "false"
+      sandbox: "sandbox-image"
+      replicas: "1"
+      containerdVersion: v2.1.1
+      openFuyaoVersion: latest
+      manifestsVersion: latest
+      providerVersion: latest
+  
+  - Name: openfuyao-system-controller
+    Version: latest
+    Param:
+      helmRepo: https://helm.openfuyao.cn/_core
+      tagVersion: latest
+```
+**适用场景**：
+- 扶摇全量产品部署
+- 包含所有功能组件
+- 需要完整的平台能力
+- 一站式部署场景
+### 四、关键差异总结
+```
+┌─────────────────────────────────────────────────────────────┐
+│                   配置差异架构图                             │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  基础插件层（所有产品共享）                                 │
+│  ┌──────────────────────────────────────────────┐          │
+│  │ kubeproxy │ calico │ coredns │ bkeagent     │          │
+│  └──────────────────────────────────────────────┘          │
+│                       │                                      │
+│                       ▼                                      │
+│  ┌──────────────────────────────────────────────┐          │
+│  │              产品差异化配置                   │          │
+│  └──────────────────────────────────────────────┘          │
+│       │              │              │                       │
+│       │              │              │                       │
+│  ┌────▼────┐    ┌────▼────┐   ┌────▼────┐                │
+│  │ 门户    │    │ 业务    │   │ 全量    │                │
+│  │ Portal  │    │ Business│   │ AllInOne│                │
+│  └────┬────┘    └────┬────┘   └────┬────┘                │
+│       │              │              │                       │
+│       │              │              │                       │
+│       ▼              ▼              ▼                       │
+│  ┌─────────┐    ┌─────────┐   ┌─────────┐                 │
+│  │cluster- │    │  无额外 │   │cluster- │                 │
+│  │api      │    │  插件   │   │api      │                 │
+│  │         │    │         │   │         │                 │
+│  │openfuyao│    │         │   │openfuyao│                 │
+│  │-system  │    │         │   │-system  │                 │
+│  │-control │    │         │   │-control │                 │
+│  │-ler     │    │         │   │-ler     │                 │
+│  └─────────┘    └─────────┘   └─────────┘                 │
+│                                                              │
+│  特点:                                                       │
+│  • fuyao-portal: 集群管理 + 平台集成                        │
+│  • fuyao-business: 仅基础K8s集群                            │
+│  • fuyao-allinone: 全功能部署                               │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+### 五、插件功能说明
+#### 5.1 cluster-api 插件
+**功能**：提供集群生命周期管理能力
+```yaml
+Name: cluster-api
+Version: v1.4.3
+Block: true  # 阻塞式安装，必须成功才能继续
+Param:
+  manage: "true"              # 启用集群管理
+  offline: "false"            # 在线/离线模式
+  sandbox: "sandbox-image"    # 沙箱镜像
+  replicas: "1"               # 副本数
+  containerdVersion: v2.1.1   # containerd版本
+  openFuyaoVersion: latest    # OpenFuyao版本
+  manifestsVersion: latest    # 清单版本
+  providerVersion: latest     # Provider版本
+```
+**核心能力**：
+- 集群创建与删除
+- 节点扩缩容
+- 集群升级
+- 集群健康检查
+#### 5.2 openfuyao-system-controller 插件
+**功能**：OpenFuyao 平台系统控制器
+```yaml
+Name: openfuyao-system-controller
+Version: latest
+Param:
+  helmRepo: https://helm.openfuyao.cn/_core
+  tagVersion: latest
+```
+**核心能力**：
+- 平台资源管理
+- 系统组件协调
+- 与 OpenFuyao 平台集成
+- 平台级监控与告警
+### 六、使用建议
+```
+┌─────────────────────────────────────────────────────────────┐
+│                   产品选择决策树                             │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  开始                                                        │
+│    │                                                         │
+│    ▼                                                         │
+│  是否需要集群管理能力？                                      │
+│    │                                                         │
+│    ├──── 否 ────> fuyao-business                            │
+│    │                (仅业务应用运行)                         │
+│    │                                                         │
+│    ▼ 是                                                      │
+│  是否需要全量平台功能？                                      │
+│    │                                                         │
+│    ├──── 否 ────> fuyao-portal                              │
+│    │                (门户场景，集群管理)                     │
+│    │                                                         │
+│    ▼ 是                                                      │
+│  fuyao-allinone                                             │
+│  (全量部署，包含所有功能)                                    │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+### 七、配置文件示例对比
+#### 7.1 fuyao-portal 生成的配置
+```yaml
+apiVersion: bke.bocloud.com/v1beta1
+kind: BKECluster
+metadata:
+  name: bke-cluster
+  namespace: default
+spec:
+  kubernetesVersion: v1.34.3-of.1
+  etcdVersion: v3.6.7-of.1
+  containerdVersion: v2.1.1
+  addons:
+    # 基础插件
+    - name: kubeproxy
+      version: v1.34.3-of.1
+    - name: calico
+      version: v3.31.3
+    - name: coredns
+      version: v1.12.2-of.1
+    - name: bkeagent-deployer
+      version: latest
+    # 门户特有插件
+    - name: cluster-api
+      version: v1.4.3
+      block: true
+    - name: openfuyao-system-controller
+      version: latest
+```
+#### 7.2 fuyao-business 生成的配置
+```yaml
+apiVersion: bke.bocloud.com/v1beta1
+kind: BKECluster
+metadata:
+  name: bke-cluster
+  namespace: default
+spec:
+  kubernetesVersion: v1.34.3-of.1
+  etcdVersion: v3.6.7-of.1
+  containerdVersion: v2.1.1
+  addons:
+    # 仅基础插件
+    - name: kubeproxy
+      version: v1.34.3-of.1
+    - name: calico
+      version: v3.31.3
+    - name: coredns
+      version: v1.12.2-of.1
+    - name: bkeagent-deployer
+      version: latest
+```
+#### 7.3 fuyao-allinone 生成的配置
+```yaml
+apiVersion: bke.bocloud.com/v1beta1
+kind: BKECluster
+metadata:
+  name: bke-cluster
+  namespace: default
+spec:
+  kubernetesVersion: v1.34.3-of.1
+  etcdVersion: v3.6.7-of.1
+  containerdVersion: v2.1.1
+  addons:
+    # 基础插件
+    - name: kubeproxy
+      version: v1.34.3-of.1
+    - name: calico
+      version: v3.31.3
+    - name: coredns
+      version: v1.12.2-of.1
+    - name: bkeagent-deployer
+      version: latest
+    # 全量特有插件（与门户相同）
+    - name: cluster-api
+      version: v1.4.3
+      block: true
+    - name: openfuyao-system-controller
+      version: latest
+```
+### 八、总结
+**核心区别**：
+1. **fuyao-portal (扶摇门户)**：
+   - 包含基础插件 + cluster-api + openfuyao-system-controller
+   - 适用于需要集群管理能力的门户场景
+   - 可以创建、删除、管理多个集群
+2. **fuyao-business (扶摇业务)**：
+   - 仅包含基础插件（kubeproxy、calico、coredns、bkeagent-deployer）
+   - 适用于纯业务应用运行场景
+   - 轻量化部署，资源占用最少
+3. **fuyao-allinone (扶摇全量)**：
+   - 包含基础插件 + cluster-api + openfuyao-system-controller
+   - 与 fuyao-portal 配置相同
+   - 适用于全量部署场景，包含所有平台功能
+
+**注意**：从当前代码实现来看，`fuyao-portal` 和 `fuyao-allinone` 生成的配置是完全相同的，都调用了 `applyFuyaoCommonConfig` 方法。两者的区别可能体现在后续的部署流程或平台集成层面。
+
